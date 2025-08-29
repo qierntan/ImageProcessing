@@ -314,7 +314,7 @@ class SmartObjectCounter:
     def load_image(self):
         file_path = filedialog.askopenfilename(
             title="Select Image",
-            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff")]
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff *.webp")]
         )
         
         if file_path:
