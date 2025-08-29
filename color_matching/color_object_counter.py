@@ -35,6 +35,60 @@ def clamp_bgr_range(center: Tuple[int, int, int], tol: Tolerances) -> Tuple[np.n
     return lower, upper
 
 
+def get_most_frequent_color(roi: np.ndarray, color_space: str = 'bgr') -> Tuple[int, int, int]:
+    """Find the most frequent color in the ROI, excluding white/background colors.
+    This helps avoid background color interference when ROI is too large.
+    
+    Args:
+        roi: Region of interest image array
+        color_space: 'bgr' or 'hsv'
+    
+    Returns:
+        Most frequent non-background color as (channel1, channel2, channel3)
+    """
+    if roi.size == 0:
+        return (0, 0, 0)
+    
+    # Convert to the desired color space if needed
+    if color_space == 'hsv':
+        roi_converted = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    else:
+        roi_converted = roi.copy()
+    
+    # Reshape to get all pixels
+    pixels = roi_converted.reshape(-1, 3)
+    
+    # For better performance with large ROIs, we can sample pixels
+    if len(pixels) > 10000:  # If ROI is very large, sample pixels
+        step = len(pixels) // 5000
+        pixels = pixels[::step]
+    
+    # Filter out background colors (white, very light colors)
+    if color_space == 'hsv':
+        # In HSV: filter out pixels with very low saturation (grayish/white)
+        # and very high value (bright/white)
+        mask = (pixels[:, 1] > 30) & (pixels[:, 2] < 240)  # S > 30, V < 240
+        filtered_pixels = pixels[mask]
+    else:
+        # In BGR: filter out pixels that are too bright (white-ish)
+        brightness = np.mean(pixels, axis=1)
+        mask = brightness < 200  # Exclude very bright pixels
+        filtered_pixels = pixels[mask]
+    
+    # If we filtered out too many pixels, fall back to original
+    if len(filtered_pixels) < len(pixels) * 0.1:  # Less than 10% remaining
+        filtered_pixels = pixels
+    
+    # Find unique colors and their counts
+    unique_colors, counts = np.unique(filtered_pixels, axis=0, return_counts=True)
+    
+    # Get the most frequent color
+    most_frequent_idx = np.argmax(counts)
+    most_frequent_color = unique_colors[most_frequent_idx]
+    
+    return tuple(map(int, most_frequent_color))
+
+
 def compute_mask(
     img_bgr: np.ndarray,
     roi_mean_bgr: Tuple[int, int, int],
@@ -45,8 +99,29 @@ def compute_mask(
 ) -> np.ndarray:
     if use_hsv:
         hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-        low, high = clamp_hsv_range(roi_mean_hsv, tol)
-        mask = cv2.inRange(hsv, low, high)
+        h, s, v = roi_mean_hsv
+        # Handle hue wrap-around for colors like red near 0/179
+        h_low = h - tol.hue
+        h_high = h + tol.hue
+        s_low = max(0, s - tol.sat)
+        s_high = min(255, s + tol.sat)
+        v_low = max(0, v - tol.val)
+        v_high = min(255, v + tol.val)
+        if h_low < 0 or h_high > 179:
+            # Split into two ranges around the circular hue
+            h_low_1 = (h_low + 180) if h_low < 0 else h_low
+            h_high_1 = 179
+            h_low_2 = 0
+            h_high_2 = (h_high - 180) if h_high > 179 else h_high
+            low1 = np.array([h_low_1, s_low, v_low], dtype=np.uint8)
+            high1 = np.array([h_high_1, s_high, v_high], dtype=np.uint8)
+            low2 = np.array([h_low_2, s_low, v_low], dtype=np.uint8)
+            high2 = np.array([h_high_2, s_high, v_high], dtype=np.uint8)
+            mask = cv2.inRange(hsv, low1, high1) | cv2.inRange(hsv, low2, high2)
+        else:
+            low = np.array([max(0, h_low), s_low, v_low], dtype=np.uint8)
+            high = np.array([min(179, h_high), s_high, v_high], dtype=np.uint8)
+            mask = cv2.inRange(hsv, low, high)
     else:
         low, high = clamp_bgr_range(roi_mean_bgr, tol)
         mask = cv2.inRange(img_bgr, low, high)
@@ -70,8 +145,46 @@ def count_and_draw(mask: np.ndarray, img_rgb: np.ndarray, min_area: int):
         cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
         cx, cy = centroids[i]
         cv2.circle(vis, (int(cx), int(cy)), 3, (0, 0, 255), -1)
-    cv2.putText(vis, f"Count: {count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (36, 255, 12), 2, cv2.LINE_AA)
     return vis, count
+
+
+# ----------------------- Segmentation helpers -----------------------
+def apply_watershed_split(mask: np.ndarray, img_bgr: np.ndarray, sensitivity: int, morph_kernel: int) -> np.ndarray:
+    """Split touching objects in a binary mask using watershed.
+
+    sensitivity: 1..80 roughly controls foreground threshold; higher splits more.
+    morph_kernel: reuse UI kernel size to build structuring element.
+    """
+    if mask is None or img_bgr is None:
+        return mask
+    # Ensure binary mask 0/255
+    bin_mask = (mask > 0).astype(np.uint8) * 255
+
+    ksize = max(3, morph_kernel | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    # Sure background
+    sure_bg = cv2.dilate(bin_mask, kernel, iterations=1)
+    # Distance transform for sure foreground
+    dist = cv2.distanceTransform(bin_mask, cv2.DIST_L2, 5)
+    if dist.max() > 0:
+        dist_norm = dist / (dist.max() + 1e-6)
+    else:
+        dist_norm = dist
+    # Map sensitivity (1..80) to threshold 0.2..0.7
+    thr = 0.2 + (min(max(sensitivity, 1), 80) / 80.0) * (0.7 - 0.2)
+    sure_fg = (dist_norm > thr).astype(np.uint8) * 255
+    # Unknown region
+    unknown = cv2.subtract(sure_bg, sure_fg)
+    # Markers
+    num_markers, markers = cv2.connectedComponents((sure_fg > 0).astype(np.uint8))
+    markers = markers + 1
+    markers[unknown > 0] = 0
+    # Watershed expects 3-channel BGR image
+    ws_markers = cv2.watershed(img_bgr.copy(), markers)
+    # Build refined mask: labels > 1 are objects; boundary is -1
+    refined = np.zeros_like(bin_mask)
+    refined[ws_markers > 1] = 255
+    return refined
 
 
 # ----------------------- GUI -----------------------
@@ -100,11 +213,14 @@ class ObjectCounterGUI:
         self.kernel = 3
         self.min_area = 100
         self.use_hsv = True               # default mode
-        self._preview_after_id = None
 
         # precomputed helpers
         self.gray_image = None
         self.binary_image = None
+
+        # watershed options
+        self.use_watershed = False
+        self.ws_sensitivity = 35
 
         self.setup_gui()
 
@@ -156,11 +272,19 @@ class ObjectCounterGUI:
         instruction_frame.pack(fill=tk.X, pady=10)
         instructions = (
             "1) Load an image\n"
-            "2) App highlights objects; click one to set as reference, or drag a box to pick ROI\n"
+            "2) Drag a box to select ROI (reference object)\n"
             "3) Adjust sliders (HSV/BGR)\n"
             "4) Click 'Count Objects'"
         )
         ttk.Label(instruction_frame, text=instructions, justify=tk.LEFT).pack(padx=10, pady=8)
+
+        # ROI preview panel
+        roi_frame = ttk.LabelFrame(scrollable_frame, text="Selected ROI")
+        roi_frame.pack(fill=tk.X, pady=10)
+        self.roi_preview_size = 150
+        self.roi_preview_label = tk.Label(roi_frame, width=self.roi_preview_size, height=self.roi_preview_size, bg="#f0f0f0")
+        self.roi_preview_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.roi_photo = None
 
         results_frame = ttk.LabelFrame(scrollable_frame, text="Results")
         results_frame.pack(fill=tk.X, pady=10)
@@ -222,17 +346,49 @@ class ObjectCounterGUI:
         except Exception:
             self.mode_var.trace("w", lambda *a: self.on_mode_change())
 
+        # Watershed refinement controls
+        ws_frame = ttk.LabelFrame(scrollable_frame, text="Segmentation Refinement")
+        ws_frame.pack(fill=tk.X, pady=10)
+        self.ws_var = tk.IntVar(value=0)
+        def _on_ws_toggle():
+            self.use_watershed = (self.ws_var.get() == 1)
+            self.update_preview()
+            if hasattr(self, 'results') and self.results:
+                self.display_results()
+        ttk.Checkbutton(ws_frame, text="Split touching objects (watershed)", variable=self.ws_var,
+                        command=_on_ws_toggle).pack(anchor=tk.W)
+        ttk.Label(ws_frame, text="Sensitivity").pack(anchor=tk.W, padx=6)
+        self.ws_slider = tk.Scale(ws_frame, from_=1, to=80, orient=tk.HORIZONTAL,
+                                  command=lambda v: self.on_ws_slider_change())
+        self.ws_slider.set(self.ws_sensitivity)
+        self.ws_slider.pack(fill=tk.X)
+
+        # CLAHE functionality removed as requested
+
         self.clear_results()
 
     # ----------------------- Image / ROI handlers -----------------------
     def load_image(self):
         file_path = filedialog.askopenfilename(
             title="Select Image",
-            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff *.webp")]
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff *.webp *.avif")]
         )
         if not file_path:
             return
+        
+        # Try OpenCV first
         img = cv2.imread(file_path)
+        
+        # If OpenCV fails and it's an AVIF file, try Pillow
+        if img is None and file_path.lower().endswith('.avif'):
+            try:
+                from PIL import Image
+                pil_img = Image.open(file_path)
+                img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load AVIF image: {str(e)}")
+                return
+        
         if img is None:
             messagebox.showerror("Error", "Failed to load image")
             return
@@ -250,7 +406,6 @@ class ObjectCounterGUI:
 
         self.display_image_on_canvas()
         self.clear_results()
-        self.auto_detect_objects()
 
     def display_image_on_canvas(self):
         if self.display_image is None:
@@ -277,14 +432,6 @@ class ObjectCounterGUI:
     def on_mouse_down(self, event):
         if self.image is None:
             return
-        if self.object_highlighted and self.detected_objects:
-            canvas_x = (event.x - self.canvas_offset_x) / self.scale_factor
-            canvas_y = (event.y - self.canvas_offset_y) / self.scale_factor
-            for i, (x, y, w, h) in enumerate(self.detected_objects):
-                if x <= canvas_x <= x + w and y <= canvas_y <= y + h:
-                    self.selected_roi = (x, y, x + w, y + h)
-                    self.highlight_selected_object(i)
-                    return
         self.rect_start = (event.x, event.y)
         self.drawing = True
         self.canvas.delete("selection_rect")
@@ -296,7 +443,7 @@ class ObjectCounterGUI:
         self.canvas.delete("selection_rect")
         x1, y1 = self.rect_start
         x2, y2 = self.rect_end
-        self.canvas.create_rectangle(x1, y1, x2, y2, outline="red", width=2, tags="selection_rect")
+        self.canvas.create_rectangle(x1, y1, x2, y2, outline="green", width=2, tags="selection_rect")
 
     def on_mouse_up(self, event):
         if not getattr(self, "drawing", False):
@@ -313,81 +460,23 @@ class ObjectCounterGUI:
             if x2 > x1 and y2 > y1:
                 self.selected_roi = (x1, y1, x2, y2)
                 roi = self.original_image[y1:y2, x1:x2]
-                self.roi_mean_bgr = tuple(map(int, np.mean(roi.reshape(-1, 3), axis=0)))
-                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-                self.roi_mean_hsv = tuple(map(int, np.mean(hsv.reshape(-1, 3), axis=0)))
+                # Use most frequent color instead of mean to avoid background interference
+                self.roi_mean_bgr = get_most_frequent_color(roi, 'bgr')
+                self.roi_mean_hsv = get_most_frequent_color(roi, 'hsv')
                 messagebox.showinfo("Info", f"ROI selected: {self.selected_roi}")
+                self.update_roi_preview()
 
-    # ----------------------- Auto-detect & highlight -----------------------
-    def auto_detect_objects(self):
-        if self.gray_image is None:
-            return
-        blurred = cv2.GaussianBlur(self.gray_image, (5, 5), 0)
-        binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 11, 2)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        min_area = 500
-        max_area = 30000
-        self.detected_objects = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if min_area < area < max_area:
-                x, y, w, h = cv2.boundingRect(contour)
-                aspect_ratio = h / w if w > 0 else 0
-                if 0.3 < aspect_ratio < 3.0:
-                    perimeter = cv2.arcLength(contour, True)
-                    if perimeter > 0:
-                        circularity = 4 * np.pi * area / (perimeter * perimeter)
-                        if 0.2 < circularity < 0.9:
-                            rect_area = w * h
-                            if rect_area > 0 and area / rect_area > 0.3:
-                                self.detected_objects.append((x, y, w, h))
-
-        if not self.detected_objects:
-            messagebox.showinfo("Info", "No objects detected in the image.")
-            return
-        self.highlight_detected_objects()
-        self.object_highlighted = True
-        messagebox.showinfo("Info", f"Found {len(self.detected_objects)} objects. Click one to use as reference.")
-
-    def highlight_detected_objects(self):
-        if not self.detected_objects:
-            return
-        highlight_image = self.image.copy()
-        for i, (x, y, w, h) in enumerate(self.detected_objects):
-            color = (255, 0, 255)
-            cv2.rectangle(highlight_image, (x, y), (x + w, y + h), color, 2)
-            cv2.putText(highlight_image, f"Object {i+1}", (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        self.display_image = highlight_image
-        self.display_image_on_canvas()
-
-    def highlight_selected_object(self, selected_index: int):
-        if not self.detected_objects:
-            return
-        highlight_image = self.image.copy()
-        for i, (x, y, w, h) in enumerate(self.detected_objects):
-            if i == selected_index:
-                color = (0, 255, 0); thickness = 3
-                cv2.putText(highlight_image, f"Reference (Object {i+1})", (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            else:
-                color = (255, 0, 255); thickness = 2
-                cv2.putText(highlight_image, f"Object {i+1}", (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            cv2.rectangle(highlight_image, (x, y), (x + w, y + h), color, thickness)
-        self.display_image = highlight_image
-        self.display_image_on_canvas()
+    # ----------------------- Manual ROI selection only -----------------------
 
     # ----------------------- Results & counting -----------------------
     def clear_results(self):
         self.results = {}
         self.results_text.delete(1.0, tk.END)
         self.results_text.insert(tk.END, "No results yet. Load an image and select a reference object.\n")
+        # Clear ROI preview
+        if hasattr(self, 'roi_preview_label'):
+            self.roi_preview_label.config(image="", text="(no ROI)")
+            self.roi_photo = None
 
     def count_objects(self):
         if self.image is None:
@@ -421,10 +510,16 @@ class ObjectCounterGUI:
 
             # compute mask using original BGR image
             roi = self.original_image[y1:y2, x1:x2]
-            roi_mean_bgr = tuple(map(int, np.mean(roi.reshape(-1, 3), axis=0)))
-            roi_mean_hsv = tuple(map(int, np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).reshape(-1, 3), axis=0)))
+            # Use most frequent color instead of mean to avoid background interference
+            roi_mean_bgr = get_most_frequent_color(roi, 'bgr')
+            roi_mean_hsv = get_most_frequent_color(roi, 'hsv')
             mask = compute_mask(self.original_image, roi_mean_bgr, roi_mean_hsv,
                                 self.tol, self.use_hsv, self.kernel)
+
+            # Optional watershed split
+            if self.use_watershed:
+                self.ws_sensitivity = int(self.ws_slider.get())
+                mask = apply_watershed_split(mask, self.original_image, self.ws_sensitivity, self.kernel)
 
             vis, _ = count_and_draw(mask, self.image, self.min_area)
 
@@ -452,7 +547,7 @@ class ObjectCounterGUI:
         if self.results.get('no_reference_selected', False):
             results_text = ("No reference object selected.\n\n"
                             "Objects Detected : 0\n\n"
-                            "Tip: Click a highlighted object or drag to select an ROI.")
+                            "Tip: Drag to select an ROI (reference object).")
         elif self.results.get('no_objects_found', False):
             results_text = ("No objects found in the image.\n\n"
                             "Objects Detected : 0\n\n"
@@ -464,9 +559,12 @@ class ObjectCounterGUI:
             else:
                 mode_info = f"B:{self.tol.b}  G:{self.tol.g}  R:{self.tol.r}"
             
+            ws_info = f"  WS:{'on' if self.use_watershed else 'off'}"
+            if self.use_watershed:
+                ws_info += f"({int(self.ws_slider.get())})"
             results_text = (f"Reference Object Area: {self.results['reference_area']:.1f} px²\n"
                             f"Objects Detected : {len(self.results['objects'])}\n\n"
-                            f"Mode: {'HSV' if self.use_hsv else 'BGR'}\n"
+                            f"Mode: {'HSV' if self.use_hsv else 'BGR'}{ws_info}\n"
                             f"{mode_info}\n"
                             f"Kernel:{self.kernel}  MinArea:{self.min_area}")
         self.results_text.insert(tk.END, results_text)
@@ -488,16 +586,9 @@ class ObjectCounterGUI:
         self.display_image_on_canvas()
 
     # ----------------------- Preview helpers -----------------------
-    def schedule_preview(self, delay: int = 120):
-        try:
-            if self._preview_after_id is not None:
-                self.root.after_cancel(self._preview_after_id)
-        except Exception:
-            pass
-        self._preview_after_id = self.root.after(delay, self.update_preview)
 
     def on_slider_change(self):
-        """Called when any slider changes - updates preview and results"""
+        """Called when any slider changes - updates preview and results instantly"""
         # Update tolerance values based on current mode
         if self.use_hsv:
             self.tol.hue = int(self.hue_slider.get())
@@ -508,7 +599,7 @@ class ObjectCounterGUI:
             self.tol.g = int(self.sat_slider.get())
             self.tol.r = int(self.val_slider.get())
         
-        self.schedule_preview(10)
+        self.update_preview()
         # Update results display immediately when sliders change
         if hasattr(self, 'results') and self.results:
             self.display_results()
@@ -548,7 +639,7 @@ class ObjectCounterGUI:
             self.sat_slider.set(self.tol.g)
             self.val_slider.set(self.tol.r)
         
-        self.schedule_preview(10)
+        self.update_preview()
         # Update results display immediately when mode changes
         if hasattr(self, 'results') and self.results:
             self.display_results()
@@ -572,10 +663,15 @@ class ObjectCounterGUI:
 
         x1, y1, x2, y2 = self.selected_roi
         roi = self.original_image[y1:y2, x1:x2]
-        roi_mean_bgr = tuple(map(int, np.mean(roi.reshape(-1, 3), axis=0)))
-        roi_mean_hsv = tuple(map(int, np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).reshape(-1, 3), axis=0)))
+        # Use most frequent color instead of mean to avoid background interference
+        roi_mean_bgr = get_most_frequent_color(roi, 'bgr')
+        roi_mean_hsv = get_most_frequent_color(roi, 'hsv')
         mask = compute_mask(self.original_image, roi_mean_bgr, roi_mean_hsv,
                             self.tol, self.use_hsv, self.kernel)
+        # Optional watershed split for preview
+        if self.use_watershed:
+            self.ws_sensitivity = int(self.ws_slider.get())
+            mask = apply_watershed_split(mask, self.original_image, self.ws_sensitivity, self.kernel)
         vis, count = count_and_draw(mask, self.image, max(1, self.min_area))
         
         # Update results with the current detection
@@ -589,6 +685,14 @@ class ObjectCounterGUI:
         
         self.display_image = vis
         self.display_image_on_canvas()
+
+    def on_ws_slider_change(self):
+        self.ws_sensitivity = int(self.ws_slider.get())
+        self.update_preview()
+        if hasattr(self, 'results') and self.results:
+            self.display_results()
+
+
 
     # ----------------------- Save & Reset -----------------------
     def save_result(self):
@@ -623,8 +727,38 @@ class ObjectCounterGUI:
         self.kernel_slider.set(3)
         self.min_slider.set(100)
 
+        # Watershed
+        if hasattr(self, 'ws_var'):
+            self.ws_var.set(0)
+        if hasattr(self, 'ws_slider'):
+            self.ws_slider.set(35)
+
         self.canvas.delete("all")
         self.clear_results()
+
+    def update_roi_preview(self):
+        if self.selected_roi is None or self.original_image is None:
+            return
+        x1, y1, x2, y2 = self.selected_roi
+        if x2 <= x1 or y2 <= y1:
+            return
+        roi_bgr = self.original_image[y1:y2, x1:x2]
+        if roi_bgr.size == 0:
+            return
+        roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+        h, w = roi_rgb.shape[:2]
+        size = self.roi_preview_size
+        scale = min(size / max(1, w), size / max(1, h))
+        new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+        roi_resized = cv2.resize(roi_rgb, (new_w, new_h))
+        # Paste centered on a gray canvas
+        canvas = np.full((size, size, 3), 240, dtype=np.uint8)
+        y_off = (size - new_h) // 2
+        x_off = (size - new_w) // 2
+        canvas[y_off:y_off+new_h, x_off:x_off+new_w] = roi_resized
+        pil = Image.fromarray(canvas)
+        self.roi_photo = ImageTk.PhotoImage(pil)
+        self.roi_preview_label.config(image=self.roi_photo, text="")
 
     # ----------------------- End class -----------------------
 
