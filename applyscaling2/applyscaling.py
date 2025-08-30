@@ -80,17 +80,22 @@ class SmartObjectCounter:
     def _ensure_yolo(self):
         """Lazy-load YOLO model if available. Return True if loaded."""
         if not self.use_yolo:
+            print("YOLO disabled by user")
             return False
         if self.yolo_model is not None:
+            print("YOLO already loaded")
             return True
         try:
             from ultralytics import YOLO
+            print("Loading YOLO model...")
             # Small model for speed; user can swap to yolov8s.pt or better
             self.yolo_model = YOLO("yolov8n.pt")
             # names mapping lives on model
             self.yolo_names = self.yolo_model.model.names if hasattr(self.yolo_model, "model") else None
+            print(f"YOLO loaded successfully with {len(self.yolo_names) if self.yolo_names else 0} classes")
             return True
-        except Exception:
+        except Exception as e:
+            print(f"YOLO failed to load: {e}")
             # If import or load fails, disable YOLO for this session
             self.use_yolo = False
             self.yolo_model = None
@@ -139,7 +144,6 @@ class SmartObjectCounter:
             bboxes = []
             # Dynamic minimums scale with image size
             min_area = max(150, int(0.00005 * h_img * w_img))
-            small_min_area = max(50, int(0.00001 * h_img * w_img))
             for label in range(2, num_labels + 2):
                 component = (markers == label).astype(np.uint8) * 255
                 if cv2.countNonZero(component) == 0:
@@ -160,45 +164,12 @@ class SmartObjectCounter:
                 # Rules: very wide-thin regions, very small height, or low fill ratio are likely text
                 if aspect_ratio > 6.0 and h < int(0.18 * h_img):
                     continue
-                if h < max(6, int(0.015 * h_img)) or w < max(6, int(0.015 * w_img)):
+                if h < max(10, int(0.02 * h_img)) or w < max(10, int(0.02 * w_img)):
                     continue
                 if extent < 0.22:
                     continue
 
                 bboxes.append((x, y, w, h))
-
-            # Extra small-object pass: operate on the non-eroded mask to recover tiny screws
-            small_cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for c in small_cnts:
-                area = cv2.contourArea(c)
-                if not (small_min_area <= area < min_area):
-                    continue
-                x, y, w, h = cv2.boundingRect(c)
-                aspect_ratio = w / h if h > 0 else 0
-                bbox_area = w * h
-                extent = area / bbox_area if bbox_area > 0 else 0
-                if aspect_ratio > 8.0 and h < int(0.12 * h_img):
-                    continue
-                if h < max(5, int(0.01 * h_img)) or w < max(5, int(0.01 * w_img)):
-                    continue
-                if extent < 0.30:
-                    continue
-                # Avoid duplicates: skip if it overlaps strongly with an existing box
-                duplicate = False
-                for bx, by, bw, bh in bboxes:
-                    bx2, by2 = bx + bw, by + bh
-                    x2, y2 = x + w, y + h
-                    ix1, iy1 = max(bx, x), max(by, y)
-                    ix2, iy2 = min(bx2, x2), min(by2, y2)
-                    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
-                    inter = iw * ih
-                    union = bw * bh + w * h - inter
-                    iou = inter / union if union > 0 else 0.0
-                    if iou > 0.5:
-                        duplicate = True
-                        break
-                if not duplicate:
-                    bboxes.append((x, y, w, h))
 
             # Merge adjacent/overlapping boxes to prevent over-segmentation
             return self._merge_adjacent_boxes(bboxes, (h_img, w_img))
@@ -314,7 +285,7 @@ class SmartObjectCounter:
     def load_image(self):
         file_path = filedialog.askopenfilename(
             title="Select Image",
-            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff")]
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff *.webp")]
         )
         
         if file_path:
@@ -437,6 +408,7 @@ class SmartObjectCounter:
         try:
             # Try YOLO first
             if self._ensure_yolo():
+                print("Running YOLO detection...")
                 results = self.yolo_model(self.original_image, verbose=False)[0]
                 yolo_boxes = []
                 for b in results.boxes:
@@ -446,9 +418,12 @@ class SmartObjectCounter:
                     conf = float(b.conf[0]) if hasattr(b, 'conf') else 0.0
                     x, y, w, h = x1, y1, x2 - x1, y2 - y1
                     yolo_boxes.append({'x': x, 'y': y, 'w': w, 'h': h, 'label': label, 'conf': conf})
+                print(f"YOLO found {len(yolo_boxes)} raw detections")
                 # Keep only reasonably confident boxes
-                self.detected_objects = [d for d in yolo_boxes if d['conf'] >= 0.25]
+                self.detected_objects = [d for d in yolo_boxes if d['conf'] >= 0.1]
+                print(f"After confidence filtering: {len(self.detected_objects)} objects")
                 if len(self.detected_objects) == 0:
+                    print("YOLO found no confident objects, falling back to classical method")
                     # Fall back to classical pipeline if YOLO found nothing
                     pass
                 else:

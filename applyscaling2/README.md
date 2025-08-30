@@ -16,8 +16,9 @@ A Python application that allows users to count objects in images by selecting a
 1. Install Python 3.7 or higher
 2. Install required dependencies:
    ```bash
-   pip install -r requirements.txt
+   python -m pip install -r requirements.txt
    ```
+   pip install ultralytics
 
 ## Usage
 
@@ -93,3 +94,10 @@ This project is open source and available under the MIT License.
 
 use this to run
 "C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe" applyscaling.py
+
+
+Steps to run (in cmd): 
+
+1. python -m pip install -r requirements.txt
+2. pip install ultralytics
+3. python applyscaling.py
