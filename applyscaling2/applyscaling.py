@@ -23,6 +23,10 @@ class SmartObjectCounter:
         self.results = {}
         self.detected_objects = []  # Store detected object bounding boxes
         self.object_highlighted = False  # Track if objects are highlighted
+        # YOLO model (lazy loaded)
+        self.yolo_model = None
+        self.yolo_names = None
+        self.use_yolo = True
         
         # GUI Setup
         self.setup_gui()
@@ -72,7 +76,241 @@ class SmartObjectCounter:
         self.canvas.bind("<Button-1>", self.on_mouse_down)
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
+    
+    def _ensure_yolo(self):
+        """Lazy-load YOLO model if available. Return True if loaded."""
+        if not self.use_yolo:
+            return False
+        if self.yolo_model is not None:
+            return True
+        try:
+            from ultralytics import YOLO
+            # Small model for speed; user can swap to yolov8s.pt or better
+            self.yolo_model = YOLO("yolov8n.pt")
+            # names mapping lives on model
+            self.yolo_names = self.yolo_model.model.names if hasattr(self.yolo_model, "model") else None
+            return True
+        except Exception:
+            # If import or load fails, disable YOLO for this session
+            self.use_yolo = False
+            self.yolo_model = None
+            self.yolo_names = None
+            return False
+
+    def _norm_box(self, obj):
+        """Return (x,y,w,h,label,conf) regardless of storage format."""
+        if isinstance(obj, dict):
+            return obj.get('x', 0), obj.get('y', 0), obj.get('w', 0), obj.get('h', 0), obj.get('label', ''), obj.get('conf', 0.0)
+        if isinstance(obj, (tuple, list)):
+            if len(obj) >= 4:
+                return obj[0], obj[1], obj[2], obj[3], obj[4] if len(obj) > 4 else '', obj[5] if len(obj) > 5 else 0.0
+        return 0, 0, 0, 0, '', 0.0
         
+    def _extract_bboxes_from_mask(self, binary_mask):
+        """Return bounding boxes from a binary foreground mask after splitting and filtering.
+        Splits touching objects with watershed and removes text-like regions.
+        """
+        try:
+            # Ensure mask is 8-bit single channel with foreground=255
+            mask = (binary_mask > 0).astype(np.uint8) * 255
+
+            # Gently erode to break thin bridges before distance transform
+            pre_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mask_eroded = cv2.erode(mask, pre_kernel, iterations=1)
+
+            # Split touching objects using watershed on distance transform
+            dist = cv2.distanceTransform(mask_eroded, cv2.DIST_L2, 5)
+            # Higher threshold for seeds so clusters split better
+            _, sure_fg = cv2.threshold(dist, 0.60 * dist.max(), 255, 0)
+            sure_fg = sure_fg.astype(np.uint8)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            sure_bg = cv2.dilate(mask_eroded, kernel, iterations=2)
+            unknown = cv2.subtract(sure_bg, sure_fg)
+            # Markers
+            num_labels, markers = cv2.connectedComponents(sure_fg)
+            markers = markers + 1
+            markers[unknown == 255] = 0
+            # Watershed requires 3-channel image; create dummy
+            color = cv2.cvtColor(mask_eroded, cv2.COLOR_GRAY2BGR)
+            cv2.watershed(color, markers)
+
+            # Each region id > 1 is an object
+            h_img, w_img = mask.shape[:2]
+            bboxes = []
+            # Dynamic minimums scale with image size
+            min_area = max(150, int(0.00005 * h_img * w_img))
+            small_min_area = max(50, int(0.00001 * h_img * w_img))
+            for label in range(2, num_labels + 2):
+                component = (markers == label).astype(np.uint8) * 255
+                if cv2.countNonZero(component) == 0:
+                    continue
+                cnts, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not cnts:
+                    continue
+                contour = max(cnts, key=cv2.contourArea)
+                area = cv2.contourArea(contour)
+                if area < min_area:
+                    continue
+                x, y, w, h = cv2.boundingRect(contour)
+
+                # Heuristics to remove text-like regions
+                aspect_ratio = w / h if h > 0 else 0
+                bbox_area = w * h
+                extent = area / bbox_area if bbox_area > 0 else 0
+                # Rules: very wide-thin regions, very small height, or low fill ratio are likely text
+                if aspect_ratio > 6.0 and h < int(0.18 * h_img):
+                    continue
+                if h < max(6, int(0.015 * h_img)) or w < max(6, int(0.015 * w_img)):
+                    continue
+                if extent < 0.22:
+                    continue
+
+                bboxes.append((x, y, w, h))
+
+            # Extra small-object pass: operate on the non-eroded mask to recover tiny screws
+            small_cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in small_cnts:
+                area = cv2.contourArea(c)
+                if not (small_min_area <= area < min_area):
+                    continue
+                x, y, w, h = cv2.boundingRect(c)
+                aspect_ratio = w / h if h > 0 else 0
+                bbox_area = w * h
+                extent = area / bbox_area if bbox_area > 0 else 0
+                if aspect_ratio > 8.0 and h < int(0.12 * h_img):
+                    continue
+                if h < max(5, int(0.01 * h_img)) or w < max(5, int(0.01 * w_img)):
+                    continue
+                if extent < 0.30:
+                    continue
+                # Avoid duplicates: skip if it overlaps strongly with an existing box
+                duplicate = False
+                for bx, by, bw, bh in bboxes:
+                    bx2, by2 = bx + bw, by + bh
+                    x2, y2 = x + w, y + h
+                    ix1, iy1 = max(bx, x), max(by, y)
+                    ix2, iy2 = min(bx2, x2), min(by2, y2)
+                    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+                    inter = iw * ih
+                    union = bw * bh + w * h - inter
+                    iou = inter / union if union > 0 else 0.0
+                    if iou > 0.5:
+                        duplicate = True
+                        break
+                if not duplicate:
+                    bboxes.append((x, y, w, h))
+
+            # Merge adjacent/overlapping boxes to prevent over-segmentation
+            return self._merge_adjacent_boxes(bboxes, (h_img, w_img))
+        except Exception:
+            # Fallback to simple contour extraction if watershed fails
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            h_img, w_img = mask.shape[:2]
+            bboxes = []
+            min_area = max(150, int(0.00005 * h_img * w_img))
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < min_area:
+                    continue
+                x, y, w, h = cv2.boundingRect(c)
+                aspect_ratio = w / h if h > 0 else 0
+                bbox_area = w * h
+                extent = area / bbox_area if bbox_area > 0 else 0
+                if aspect_ratio > 6.0 and h < int(0.18 * h_img):
+                    continue
+                if h < max(10, int(0.02 * h_img)) or w < max(10, int(0.02 * w_img)):
+                    continue
+                if extent < 0.22:
+                    continue
+                bboxes.append((x, y, w, h))
+            return self._merge_adjacent_boxes(bboxes, (h_img, w_img))
+
+    def _merge_adjacent_boxes(self, bboxes, image_shape):
+        """Merge boxes that significantly overlap or are separated by tiny gaps.
+        Prevents large objects from being split into multiple parts.
+        """
+        if not bboxes:
+            return []
+        h_img, w_img = image_shape
+        gap_thresh = int(0.005 * max(h_img, w_img))
+        image_area = h_img * w_img
+        small_area_thresh = 0.002 * image_area
+
+        def iou(a, b):
+            ax1, ay1, aw, ah = a
+            bx1, by1, bw, bh = b
+            ax2, ay2 = ax1 + aw, ay1 + ah
+            bx2, by2 = bx1 + bw, by1 + bh
+            inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
+            inter_x2, inter_y2 = min(ax2, bx2), min(ay2, by2)
+            inter_w = max(0, inter_x2 - inter_x1)
+            inter_h = max(0, inter_y2 - inter_y1)
+            inter = inter_w * inter_h
+            union = aw * ah + bw * bh - inter
+            return inter / union if union > 0 else 0.0
+
+        def gap(a, b):
+            ax1, ay1, aw, ah = a
+            bx1, by1, bw, bh = b
+            ax2, ay2 = ax1 + aw, ay1 + ah
+            bx2, by2 = bx1 + bw, by1 + bh
+            # Horizontal and vertical gaps (negative means overlap)
+            gx = max(0, max(ax1, bx1) - min(ax2, bx2))
+            gy = max(0, max(ay1, by1) - min(ay2, by2))
+            return max(gx, gy)
+
+        def overlap_lengths(a, b):
+            ax1, ay1, aw, ah = a
+            bx1, by1, bw, bh = b
+            ax2, ay2 = ax1 + aw, ay1 + ah
+            bx2, by2 = bx1 + bw, by1 + bh
+            ovx = max(0, min(ax2, bx2) - max(ax1, bx1))
+            ovy = max(0, min(ay2, by2) - max(ay1, by1))
+            return ovx, ovy
+
+        merged = True
+        boxes = bboxes[:]
+        while merged:
+            merged = False
+            new_boxes = []
+            used = [False] * len(boxes)
+            for i in range(len(boxes)):
+                if used[i]:
+                    continue
+                a = boxes[i]
+                ax1, ay1, aw, ah = a
+                ax2, ay2 = ax1 + aw, ay1 + ah
+                for j in range(i + 1, len(boxes)):
+                    if used[j]:
+                        continue
+                    b = boxes[j]
+                    ovx, ovy = overlap_lengths(a, b)
+                    min_w = min(a[2], b[2])
+                    min_h = min(a[3], b[3])
+                    area_a = a[2] * a[3]
+                    area_b = b[2] * b[3]
+                    close_aligned = gap(a, b) <= gap_thresh and (ovx >= 0.75 * min_w or ovy >= 0.75 * min_h)
+                    # Small-object safeguard: if both are small, require high IoU to merge
+                    if (area_a < small_area_thresh and area_b < small_area_thresh):
+                        should_merge = iou(a, b) > 0.6
+                    else:
+                        should_merge = iou(a, b) > 0.4 or close_aligned
+                    if should_merge:
+                        # merge
+                        bx1, by1, bw, bh = b
+                        bx2, by2 = bx1 + bw, by1 + bh
+                        nx1, ny1 = min(ax1, bx1), min(ay1, by1)
+                        nx2, ny2 = max(ax2, bx2), max(ay2, by2)
+                        a = (nx1, ny1, nx2 - nx1, ny2 - ny1)
+                        ax1, ay1, aw, ah = a
+                        ax2, ay2 = ax1 + aw, ay1 + ah
+                        used[j] = True
+                        merged = True
+                used[i] = True
+                new_boxes.append(a)
+            boxes = new_boxes
+        return boxes
+
     def load_image(self):
         file_path = filedialog.askopenfilename(
             title="Select Image",
@@ -141,7 +379,8 @@ class SmartObjectCounter:
             canvas_y = (event.y - self.canvas_offset_y) / self.scale_factor
             
             # Check if click is within any detected object
-            for i, (x, y, w, h) in enumerate(self.detected_objects):
+            for i, obj in enumerate(self.detected_objects):
+                x, y, w, h, _, _ = self._norm_box(obj)
                 if x <= canvas_x <= x + w and y <= canvas_y <= y + h:
                     # Object selected
                     self.selected_roi = (x, y, x + w, y + h)
@@ -194,54 +433,61 @@ class SmartObjectCounter:
                 print(f"Selected ROI: {self.selected_roi}")
     
     def auto_detect_objects(self):
-        """Automatically detect objects after loading an image"""
+        """Automatically detect generic objects after loading an image"""
         try:
-            # Convert to grayscale for processing
+            # Try YOLO first
+            if self._ensure_yolo():
+                results = self.yolo_model(self.original_image, verbose=False)[0]
+                yolo_boxes = []
+                for b in results.boxes:
+                    x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+                    cls_id = int(b.cls[0]) if hasattr(b, 'cls') else -1
+                    label = results.names[cls_id] if hasattr(results, 'names') and cls_id in results.names else ''
+                    conf = float(b.conf[0]) if hasattr(b, 'conf') else 0.0
+                    x, y, w, h = x1, y1, x2 - x1, y2 - y1
+                    yolo_boxes.append({'x': x, 'y': y, 'w': w, 'h': h, 'label': label, 'conf': conf})
+                # Keep only reasonably confident boxes
+                self.detected_objects = [d for d in yolo_boxes if d['conf'] >= 0.25]
+                if len(self.detected_objects) == 0:
+                    # Fall back to classical pipeline if YOLO found nothing
+                    pass
+                else:
+                    self.highlight_detected_objects()
+                    self.object_highlighted = True
+                    messagebox.showinfo("Info", f"Found {len(self.detected_objects)} objects (YOLO). Click one to select as reference.")
+                    return
+
             gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
-            
-            # Apply Gaussian blur to reduce noise
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            
-            # Use Otsu's thresholding for better segmentation
-            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            
-            # Morphological operations to connect object parts
-            kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 15))  # Vertical kernel to connect screw parts
-            kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            
-            # Close operation to connect head and shaft
-            closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_close)
-            # Open operation to remove small noise
-            cleaned = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel_open)
-            
-            # Find contours
-            contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Filter contours by area and aspect ratio (screws are typically tall and narrow)
-            min_area = 500  # Increased minimum area
-            self.detected_objects = []
-            
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area > min_area:
-                    # Get bounding rectangle
-                    x, y, w, h = cv2.boundingRect(contour)
-                    aspect_ratio = h / w if w > 0 else 0
-                    
-                    # Filter by aspect ratio (screws are typically taller than wide)
-                    if aspect_ratio > 1.2:  # Height should be at least 1.2x width
-                        self.detected_objects.append((x, y, w, h))
-            
+
+            # Auto polarity: decide whether foreground should be white or black
+            _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            white_ratio = np.mean(otsu == 255)
+            if white_ratio > 0.5:
+                # Background likely white; use inverse to get foreground white
+                _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            else:
+                _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # Morphology: use small kernels to remove noise and close small gaps
+            kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+            opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_open, iterations=1)
+            cleaned = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+
+            # Extract bounding boxes with splitting and text filtering
+            boxes = self._extract_bboxes_from_mask(cleaned)
+            # Store as simple tuples for fallback, label empty
+            self.detected_objects = [(x, y, w, h) for (x, y, w, h) in boxes]
+
             if len(self.detected_objects) == 0:
                 messagebox.showinfo("Info", "No objects detected in the image.")
                 return
-            
-            # Highlight detected objects
+
             self.highlight_detected_objects()
             self.object_highlighted = True
-            
-            messagebox.showinfo("Info", f"Found {len(self.detected_objects)} objects. Click on one to select it as reference.")
-            
+            messagebox.showinfo("Info", f"Found {len(self.detected_objects)} objects. Click one to select as reference.")
+
         except Exception as e:
             messagebox.showerror("Error", f"Error detecting objects: {str(e)}")
     
@@ -253,11 +499,13 @@ class SmartObjectCounter:
         highlight_image = self.original_image.copy()
         
         # Draw bounding boxes around detected objects
-        for i, (x, y, w, h) in enumerate(self.detected_objects):
+        for i, obj in enumerate(self.detected_objects):
+            x, y, w, h, label, conf = self._norm_box(obj)
             # Draw rectangle with different color for each object
             color = (255, 0, 255)  # Magenta for detected objects
             cv2.rectangle(highlight_image, (x, y), (x+w, y+h), color, 2)
-            cv2.putText(highlight_image, f"Object {i+1}", (x, y-10), 
+            name = label if label else f"Object {i+1}"
+            cv2.putText(highlight_image, name, (x, y-10), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         
         # Update display
@@ -272,18 +520,21 @@ class SmartObjectCounter:
         highlight_image = self.original_image.copy()
         
         # Draw bounding boxes around all detected objects
-        for i, (x, y, w, h) in enumerate(self.detected_objects):
+        for i, obj in enumerate(self.detected_objects):
+            x, y, w, h, label, conf = self._norm_box(obj)
             if i == selected_index:
                 # Highlight selected object in green
                 color = (0, 255, 0)  # Green for selected object
                 thickness = 3
-                cv2.putText(highlight_image, f"Reference (Object {i+1})", (x, y-10), 
+                ref_text = f"Reference: {label}" if label else f"Reference (Object {i+1})"
+                cv2.putText(highlight_image, ref_text, (x, y-10), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             else:
                 # Other objects in magenta
                 color = (255, 0, 255)  # Magenta for other objects
                 thickness = 2
-                cv2.putText(highlight_image, f"Object {i+1}", (x, y-10), 
+                name = label if label else f"Object {i+1}"
+                cv2.putText(highlight_image, name, (x, y-10), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             
             cv2.rectangle(highlight_image, (x, y), (x+w, y+h), color, thickness)
@@ -340,44 +591,60 @@ class SmartObjectCounter:
                 self.draw_results_on_image()
                 return
             
-            # Convert to grayscale for processing
+            # Convert to grayscale and threshold with auto-polarity
             gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
-            
-            # Apply Gaussian blur to reduce noise
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            
-            # Use Otsu's thresholding for better segmentation
-            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            
-            # Morphological operations to connect object parts
-            kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 15))  # Vertical kernel to connect screw parts
-            kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            
-            # Close operation to connect head and shaft
-            closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_close)
-            # Open operation to remove small noise
-            cleaned = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel_open)
-            
-            # Find contours
-            contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Filter contours by area and aspect ratio (screws are typically tall and narrow)
-            min_area = 500  # Increased minimum area
-            valid_contours = []
-            
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area > min_area:
-                    # Get bounding rectangle
-                    x, y, w, h = cv2.boundingRect(contour)
-                    aspect_ratio = h / w if w > 0 else 0
-                    
-                    # Filter by aspect ratio (screws are typically taller than wide)
-                    if aspect_ratio > 1.2:  # Height should be at least 1.2x width
-                        valid_contours.append(contour)
+            _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            white_ratio = np.mean(otsu == 255)
+            if white_ratio > 0.5:
+                _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            else:
+                _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # Generic morphology
+            kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+            opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_open, iterations=1)
+            cleaned = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+
+            # Bboxes as contours-like proxies (fallback)
+            bboxes = self._extract_bboxes_from_mask(cleaned)
+
+            # If YOLO is available, prefer YOLO detections for counting
+            yolo_used = False
+            ref_label = ''
+            if self._ensure_yolo():
+                # Determine reference class by intersecting click ROI with YOLO boxes
+                results = self.yolo_model(self.original_image, verbose=False)[0]
+                yolo_boxes = []
+                for b in results.boxes:
+                    x1b, y1b, x2b, y2b = map(int, b.xyxy[0].tolist())
+                    cls_id = int(b.cls[0]) if hasattr(b, 'cls') else -1
+                    label = results.names[cls_id] if hasattr(results, 'names') and cls_id in results.names else ''
+                    conf = float(b.conf[0]) if hasattr(b, 'conf') else 0.0
+                    yolo_boxes.append((x1b, y1b, x2b - x1b, y2b - y1b, label, conf))
+                # Pick the YOLO box that overlaps the selected ROI the most
+                def iou_roi(box):
+                    bx, by, bw, bh, _, _ = box
+                    bx2, by2 = bx + bw, by + bh
+                    ix1, iy1 = max(bx, x1), max(by, y1)
+                    ix2, iy2 = min(bx2, x2), min(by2, y2)
+                    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+                    inter = iw * ih
+                    union = (bw * bh) + ((x2 - x1) * (y2 - y1)) - inter
+                    return inter / union if union > 0 else 0.0
+                if len(yolo_boxes) > 0:
+                    ref_idx = max(range(len(yolo_boxes)), key=lambda i: iou_roi(yolo_boxes[i]))
+                    if iou_roi(yolo_boxes[ref_idx]) > 0.1:
+                        ref_label = yolo_boxes[ref_idx][4]
+                        # Use only same-class YOLO boxes for counting
+                        sel = [b for b in yolo_boxes if b[4] == ref_label and b[5] >= 0.25]
+                        if len(sel) > 0:
+                            bboxes = [(bx, by, bw, bh) for (bx, by, bw, bh, _, _) in sel]
+                            yolo_used = True
             
             # Check if any valid objects were found
-            if len(valid_contours) == 0:
+            if len(bboxes) == 0:
                 # No objects found in the image
                 self.results = {
                     'small': [],
@@ -422,12 +689,11 @@ class SmartObjectCounter:
             same_size_objects = []
             large_objects = []
             
-            # More sensitive thresholds
-            small_threshold = 0.6  # Objects smaller than 60% of reference
-            large_threshold = 1.05  # Objects larger than 105% of reference
+            # Thresholds relative to selected reference
+            small_threshold = 0.7
+            large_threshold = 1.3
             
-            for contour in valid_contours:
-                x, y, w, h = cv2.boundingRect(contour)
+            for (x, y, w, h) in bboxes:
                 area = w * h  # Use bounding rectangle area instead of contour area
                 ratio = area / reference_area
                 
@@ -444,7 +710,9 @@ class SmartObjectCounter:
                 'same': same_size_objects,
                 'large': large_objects,
                 'reference_area': reference_area,
-                'no_objects_found': False
+                'no_objects_found': False,
+                'yolo_used': yolo_used,
+                'reference_label': ref_label
             }
             
             # Display results
@@ -496,9 +764,12 @@ class SmartObjectCounter:
             results_text += f"Total Objects : {len(self.results['small']) + len(self.results['same']) + len(self.results['large'])}\n\n"
             
             # Add detailed information
+            if self.results.get('yolo_used', False):
+                results_text += f"Filtered by class: {self.results.get('reference_label','')} (YOLO)\n\n"
             results_text += "Detection Settings:\n"
-            results_text += "- Min area : 500 pixels\n"
-            results_text += "- Aspect ratio > 1.2\n"
+            results_text += "- Dynamic min area & watershed splitting\n"
+            results_text += "- Auto foreground polarity (Otsu)\n"
+            results_text += "- Morphology: open(3x3) + close(7x7)\n"
             results_text += "- Uses bounding rectangle area\n"
         
         self.results_text.insert(tk.END, results_text)
