@@ -90,9 +90,6 @@ A Python application that allows users to count objects in images by selecting a
 This project is open source and available under the MIT License. 
 
 
-use this to enable venv
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass .\.venv\Scripts\Activate.ps1
-
 
 use this to run
-python applyscaling.py
+"C:\Users\User\AppData\Local\Programs\Python\Python312\python.exe" applyscaling.py
