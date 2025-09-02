@@ -23,9 +23,9 @@ class SmartObjectCounter:
         # ROI
         self.selected_roi = None
 
-        # settings
-        self.template_threshold = 0.7  # default for template matching
-        self.orb_ratio = 0.75  # default Lowe’s ratio threshold
+        # settings (no user controls; values are chosen automatically per image)
+        self.template_threshold = 0.7  # populated automatically when running
+        self.orb_ratio = 0.75  # populated automatically when running
         self.postproc_mode = "none"
 
         self.setup_gui()
@@ -48,21 +48,7 @@ class SmartObjectCounter:
         ttk.Button(left_panel, text="Reset", command=self.reset).pack(fill=tk.X, pady=4)
         ttk.Button(left_panel, text="Save Result", command=self.save_result).pack(fill=tk.X, pady=4)
 
-        # Template Matching Threshold Slider
-        threshold_frame = ttk.LabelFrame(left_panel, text="Template Matching Threshold")
-        threshold_frame.pack(fill=tk.X, pady=10)
-        self.threshold_slider = tk.Scale(threshold_frame, from_=0.5, to=0.95, resolution=0.01,
-                                         orient=tk.HORIZONTAL, command=lambda v: self.update_threshold())
-        self.threshold_slider.set(self.template_threshold)
-        self.threshold_slider.pack(fill=tk.X, padx=6, pady=6)
-
-        # ORB ratio slider
-        ratio_frame = ttk.LabelFrame(left_panel, text="ORB Ratio Threshold")
-        ratio_frame.pack(fill=tk.X, pady=10)
-        self.ratio_slider = tk.Scale(ratio_frame, from_=0.6, to=0.9, resolution=0.01, 
-                                     orient=tk.HORIZONTAL, command=lambda val: self.update_orb_ratio(val))
-        self.ratio_slider.set(self.orb_ratio)
-        self.ratio_slider.pack(fill=tk.X, padx=6, pady=6)
+        # (Threshold sliders removed; thresholds are chosen automatically.)
 
         # Instructions
         instruction_frame = ttk.LabelFrame(left_panel, text="Instructions")
@@ -70,9 +56,8 @@ class SmartObjectCounter:
         instructions = """
 1. Load an image 
 2. Drag a box to select reference object
-3. Adjust threshold if needed
-4. Click "Count Objects" to analyze
-5. Save annotated result if needed
+3. Click "Count Objects" to analyze (thresholds auto-tuned)
+4. Save annotated result if needed
         """
         ttk.Label(instruction_frame, text=instructions, justify=tk.LEFT).pack(padx=10, pady=8)
 
@@ -92,10 +77,10 @@ class SmartObjectCounter:
         self.clear_results()
 
     def update_threshold(self):
-        self.template_threshold = float(self.threshold_slider.get())
+        pass
 
     def update_orb_ratio(self, val):
-        self.orb_ratio = float(self.ratio_slider.get())
+        pass
 
     # ----------------------- Image / ROI handlers -----------------------
     def load_image(self):
@@ -208,6 +193,114 @@ class SmartObjectCounter:
             idxs = idxs[np.where(overlap <= overlapThresh)[0] + 1]
         return boxes[picked].astype(int).tolist()
 
+    def preprocess_gray(self, bgr_img):
+        """Convert BGR to grayscale and enhance contrast using CLAHE."""
+        gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        return gray
+
+    def validate_detection(self, img_gray, roi_gray, x, y, w, h, roi_area, is_uniform=False):
+        """Enhanced validation for detected objects using multiple criteria."""
+        if x < 0 or y < 0 or x + w > img_gray.shape[1] or y + h > img_gray.shape[0]:
+            return False
+        
+        # Area ratio validation - more lenient for uniform objects
+        area_ratio = (w * h) / roi_area
+        if is_uniform:
+            if area_ratio < 0.25 or area_ratio > 4.5:  # More flexible for uniform objects
+                return False
+        else:
+            if area_ratio < 0.3 or area_ratio > 4.0:
+                return False
+        
+        # Edge-based validation
+        img_edges = cv2.Canny(img_gray, 50, 150)
+        roi_edges_base = cv2.Canny(roi_gray, 50, 150)
+        roi_edges = cv2.resize(roi_edges_base, (w, h))
+        patch_edges = img_edges[y:y+h, x:x+w]
+        
+        if patch_edges.size == 0:
+            return False
+            
+        edge_corr = cv2.matchTemplate(patch_edges, roi_edges, cv2.TM_CCOEFF_NORMED)
+        edge_score = float(edge_corr.max()) if edge_corr.size > 0 else 0.0
+        
+        # Adaptive edge threshold based on area ratio and uniformity
+        if is_uniform:
+            min_edge_score = max(0.20, 0.40 - (area_ratio - 1.0) * 0.06)  # Lower threshold for uniform objects
+        else:
+            min_edge_score = max(0.25, 0.45 - (area_ratio - 1.0) * 0.08)
+        
+        if edge_score < min_edge_score:
+            return False
+        
+        # Additional texture validation - more lenient for uniform objects
+        patch = img_gray[y:y+h, x:x+w]
+        if patch.size == 0:
+            return False
+            
+        # Check if the patch has sufficient texture (not too uniform)
+        patch_std = np.std(patch)
+        if is_uniform:
+            if patch_std < 8:  # More lenient for uniform objects
+                return False
+        else:
+            if patch_std < 10:  # Original threshold for distinct objects
+                return False
+        
+        return True
+
+    def compute_auto_template_threshold(self, corr_map: np.ndarray) -> float:
+        """Estimate a suitable threshold for cv2.matchTemplate correlation map.
+        Uses a more robust approach based on the distribution of correlation values.
+        """
+        # Get the top correlation values
+        flat_corr = corr_map.flatten()
+        p99 = float(np.percentile(flat_corr, 99.0))
+        p95 = float(np.percentile(flat_corr, 95.0))
+        p90 = float(np.percentile(flat_corr, 90.0))
+        
+        # Calculate standard deviation to understand the spread
+        std_dev = float(np.std(flat_corr))
+        
+        # If we have high variance, use a more conservative threshold
+        if std_dev > 0.3:
+            threshold = 0.6 * p99 + 0.4 * p95
+        else:
+            # For more uniform distributions, be more aggressive
+            threshold = 0.5 * p99 + 0.3 * p95 + 0.2 * p90
+        
+        # Ensure threshold is within reasonable bounds
+        threshold = float(np.clip(threshold, 0.45, 0.85))
+        
+        return threshold
+
+    def compute_auto_orb_ratio(self, matches_knn) -> float:
+        """Choose an ORB Lowe's ratio threshold by scanning candidates and
+        selecting the one that maximizes a proxy score of inliers and clusters.
+        """
+        # If not enough matches, return default
+        if not matches_knn or len(matches_knn) < 8:
+            return 0.75
+
+        # Build simple distribution as fallback
+        ratios = []
+        for m_n in matches_knn:
+            if len(m_n) != 2:
+                continue
+            m, n = m_n
+            if n.distance <= 1e-6:
+                continue
+            ratios.append(m.distance / n.distance)
+        if len(ratios) < 8:
+            return 0.75
+
+        # Prefer a stricter threshold, but search for the best in [0.60, 0.90]
+        base = float(np.percentile(ratios, 35))
+        base = float(np.clip(base, 0.6, 0.9))
+        return base
+
     # ----------------------- Detection -----------------------
     def count_objects(self):
         if self.original_image is None:
@@ -232,14 +325,16 @@ class SmartObjectCounter:
         vis_bgr = self.original_image.copy()  # draw on BGR copy
 
         if method_used == "Template Matching":
-            # Convert original image and ROI to grayscale
-            img_gray = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
-            roi_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+            # Convert original image and ROI to enhanced grayscale
+            img_gray = self.preprocess_gray(self.original_image)
+            roi_gray = self.preprocess_gray(roi_bgr)
 
+            # Template Matching section in count_objects method
             rectangles = []
-            angles = range(0, 360, 30)
-            scales = [0.8, 1.0, 1.2]
+            angles = range(0, 360, 8)  # Use 8-degree increments for finer rotation detection
+            scales = [0.60, 0.70, 0.80, 0.90, 1.0, 1.1, 1.2, 1.3, 1.4]  # More scale variations
 
+            used_thresholds = []
             for angle in angles:
                 rotated_roi = self.rotate_image(roi_bgr, angle)  # rotate ROI in BGR
                 rotated_gray = cv2.cvtColor(rotated_roi, cv2.COLOR_BGR2GRAY)  # convert rotated ROI to gray
@@ -252,18 +347,141 @@ class SmartObjectCounter:
 
                     scaled_roi_gray = cv2.resize(rotated_gray, (scaled_w, scaled_h))
                     res = cv2.matchTemplate(img_gray, scaled_roi_gray, cv2.TM_CCOEFF_NORMED)
-                    loc = np.where(res >= self.template_threshold)
+                    
+                    # Check if we're likely dealing with uniform objects
+                    res_mean = np.mean(res)
+                    res_std = np.std(res)
+                    is_uniform = res_mean > 0.15 and res_std < 0.2
+                    
+                    # Use robust map-based threshold around top peaks
+                    auto_thr = self.compute_auto_template_threshold(res)
+                    
+                    # For uniform objects like chairs, be much more aggressive
+                    if is_uniform:
+                        auto_thr = max(0.35, auto_thr - 0.12)  # Even lower threshold for better detection
+                    
+                    self.template_threshold = auto_thr
+                    used_thresholds.append(auto_thr)
+                    
+                    # Local maxima to avoid clusters of overlapping candidates
+                    # Use smaller kernel for uniform objects to catch more instances
+                    kh = max(2, int(round(scaled_h * 0.06))) if is_uniform else max(3, int(round(scaled_h * 0.08)))
+                    kw = max(2, int(round(scaled_w * 0.06))) if is_uniform else max(3, int(round(scaled_w * 0.08)))
+                    kernel = np.ones((kh, kw), np.uint8)
+                    res_dil = cv2.dilate(res, kernel)
+                    maxima = (res >= auto_thr) & (res == res_dil)
+                    ys, xs = np.where(maxima)
+                    for y, x in zip(ys, xs):
+                        rectangles.append([x, y, scaled_w, scaled_h])
+                
+                # Also try horizontally flipped version to detect left-right mirrored objects
+                flipped_roi = cv2.flip(rotated_roi, 1)  # 1 = horizontal flip
+                flipped_gray = cv2.cvtColor(flipped_roi, cv2.COLOR_BGR2GRAY)
+                
+                for scale in scales:
+                    scaled_w = int(flipped_gray.shape[1] * scale)
+                    scaled_h = int(flipped_gray.shape[0] * scale)
+                    if scaled_w < 10 or scaled_h < 10:
+                        continue
 
-                    for pt in zip(*loc[::-1]):
-                        rect = [pt[0], pt[1], scaled_roi_gray.shape[1], scaled_roi_gray.shape[0]]
-                        rectangles.append(rect)
+                    scaled_flipped_gray = cv2.resize(flipped_gray, (scaled_w, scaled_h))
+                    res_flipped = cv2.matchTemplate(img_gray, scaled_flipped_gray, cv2.TM_CCOEFF_NORMED)
+                    
+                    # Use same threshold calculation
+                    auto_thr_flipped = self.compute_auto_template_threshold(res_flipped)
+                    
+                    # For uniform objects like chairs, be much more aggressive
+                    if is_uniform:
+                        auto_thr_flipped = max(0.35, auto_thr_flipped - 0.12)
+                    
+                    used_thresholds.append(auto_thr_flipped)
+                    
+                    # Local maxima for flipped version
+                    kh = max(2, int(round(scaled_h * 0.06))) if is_uniform else max(3, int(round(scaled_h * 0.08)))
+                    kw = max(2, int(round(scaled_w * 0.06))) if is_uniform else max(3, int(round(scaled_w * 0.08)))
+                    kernel = np.ones((kh, kw), np.uint8)
+                    res_dil = cv2.dilate(res_flipped, kernel)
+                    maxima = (res_flipped >= auto_thr_flipped) & (res_flipped == res_dil)
+                    ys, xs = np.where(maxima)
+                    
+                    for y, x in zip(ys, xs):
+                        rectangles.append([x, y, scaled_w, scaled_h])
 
-            # Group & suppress overlapping rectangles
+            # After collecting rectangles, modify grouping and NMS
             if rectangles:
-                rectangles, _ = cv2.groupRectangles(rectangles, groupThreshold=1, eps=0.5)
-                rectangles = self.non_max_suppression(rectangles, overlapThresh=0.3)
+                # For uniform objects, use more lenient grouping
+                is_uniform = len(rectangles) > 20  # Many candidates suggest uniform objects
+                
+                if is_uniform:
+                    # More lenient grouping for uniform objects
+                    rectangles, _ = cv2.groupRectangles(rectangles, groupThreshold=1, eps=0.7)
+                    rectangles = self.non_max_suppression(rectangles, overlapThresh=0.45)  # More lenient overlap
+                else:
+                    # Original approach for distinct objects
+                    rectangles, _ = cv2.groupRectangles(rectangles, groupThreshold=1, eps=0.5)
+                    rectangles = self.non_max_suppression(rectangles, overlapThresh=0.3)
             else:
                 rectangles = []
+
+            # Secondary validation using edges and size consistency
+            if rectangles:
+                img_edges = cv2.Canny(img_gray, 50, 150)
+                roi_edges_base = cv2.Canny(roi_gray, 50, 150)
+
+                validated = []
+                roi_area = float(roi_gray.shape[0] * roi_gray.shape[1] + 1e-6)
+                
+                # Check if we're dealing with uniform objects (like chairs)
+                is_uniform = len(rectangles) > 10
+                
+                for (x, y, w, h) in rectangles:
+                    if not self.validate_detection(img_gray, roi_gray, x, y, w, h, roi_area, is_uniform):
+                        continue
+                            
+                    validated.append((x, y, w, h))
+                rectangles = validated
+
+            # If nothing validated, fallback to edge-only template matching with flipping
+            if not rectangles:
+                img_edges = cv2.Canny(img_gray, 50, 150)
+                roi_edges_base = cv2.Canny(roi_gray, 50, 150)
+                rectangles_fallback = []
+                fine_angles = range(0, 360, 15)  # Use finer angles for better detection
+                scales_fb = [0.7, 0.85, 1.0, 1.15, 1.3]  # More scale variations
+                
+                for ang in fine_angles:
+                    # Process normal rotated edges
+                    rot_edges = self.rotate_image(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB), ang)
+                    rot_edges = cv2.cvtColor(rot_edges, cv2.COLOR_RGB2GRAY)
+                    rot_edges = cv2.Canny(rot_edges, 50, 150)
+                    
+                    # Also process flipped version
+                    flipped_edges = cv2.flip(rot_edges, 1)
+                    
+                    for sc in scales_fb:
+                        w_fb = int(rot_edges.shape[1] * sc)
+                        h_fb = int(rot_edges.shape[0] * sc)
+                        if w_fb < 15 or h_fb < 15:
+                            continue
+                            
+                        # Process normal edges
+                        tmpl = cv2.resize(rot_edges, (w_fb, h_fb))
+                        res = cv2.matchTemplate(img_edges, tmpl, cv2.TM_CCOEFF_NORMED)
+                        thr_fb = max(0.35, float(np.percentile(res, 97.5)))  # More aggressive threshold
+                        loc = np.where(res >= thr_fb)
+                        for pt in zip(*loc[::-1]):
+                            rectangles_fallback.append([pt[0], pt[1], w_fb, h_fb])
+                        
+                        # Process flipped edges
+                        tmpl_flipped = cv2.resize(flipped_edges, (w_fb, h_fb))
+                        res_flipped = cv2.matchTemplate(img_edges, tmpl_flipped, cv2.TM_CCOEFF_NORMED)
+                        loc_flipped = np.where(res_flipped >= thr_fb)
+                        for pt in zip(*loc_flipped[::-1]):
+                            rectangles_fallback.append([pt[0], pt[1], w_fb, h_fb])
+                
+                if rectangles_fallback:
+                    rectangles_fallback = self.non_max_suppression(rectangles_fallback, overlapThresh=0.4)
+                rectangles = rectangles_fallback
 
             # Draw results
             vis_bgr = self.original_image.copy()
@@ -272,15 +490,16 @@ class SmartObjectCounter:
 
             self.display_image = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
             self.display_image_on_canvas()
+            avg_thr = (np.mean(used_thresholds) if used_thresholds else self.template_threshold)
             results_info = (f"Method used: {method_used}\n"
                             f"Objects Found: {len(rectangles)}\n"
-                            f"Threshold: {self.template_threshold:.2f}\n")
+                            f"Auto Threshold: {avg_thr:.2f}\n")
 
         else:
             # ORB-based multi-instance detection (FLANN + ratio test)
-            orb = cv2.ORB_create(nfeatures=400)
-            roi_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-            img_gray = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
+            orb = cv2.ORB_create(nfeatures=1200)
+            roi_gray = self.preprocess_gray(roi_bgr)
+            img_gray = self.preprocess_gray(self.original_image)
             kp_roi, des_roi = orb.detectAndCompute(roi_gray, None)
             kp_img, des_img = orb.detectAndCompute(img_gray, None)
             if des_roi is None or des_img is None:
@@ -300,52 +519,75 @@ class SmartObjectCounter:
             except Exception:
                 matches_knn = []
 
-            # Lowe’s ratio test
-            good = []
-            for m_n in matches_knn:
-                if len(m_n) != 2:
-                    continue
-                m, n = m_n
-                if m.distance < self.orb_ratio * n.distance:
-                    good.append(m)
-
-            objects_found = 0
-            if len(good) >= 8:
-                dst_pts = np.float32([kp_img[m.trainIdx].pt for m in good])
-
-                # cluster matches relative to ROI size (not whole image)
-                roi_diag = np.hypot(roi_bgr.shape[1], roi_bgr.shape[0])
-                eps = max(10.0, roi_diag * 0.25)
-                clustering = DBSCAN(eps=eps, min_samples=6).fit(dst_pts)
-                labels = clustering.labels_
-
-                unique_labels = set(labels)
-                if -1 in unique_labels:
-                    unique_labels.remove(-1)
-
-                for lbl in unique_labels:
-                    inds = [i for i, lab in enumerate(labels) if lab == lbl]
-                    if len(inds) < 6:
+            def evaluate_with_ratio(ratio):
+                good_local = []
+                for m_n in matches_knn:
+                    if len(m_n) != 2:
                         continue
+                    m, n = m_n
+                    if m.distance < ratio * n.distance:
+                        good_local.append(m)
 
-                    cluster_matches = [good[i] for i in inds]
-                    src_pts = np.float32([kp_roi[m.queryIdx].pt for m in cluster_matches]).reshape(-1, 1, 2)
-                    dst_pts_cluster = np.float32([kp_img[m.trainIdx].pt for m in cluster_matches]).reshape(-1, 1, 2)
-
-                    M, mask = cv2.findHomography(src_pts, dst_pts_cluster, cv2.RANSAC, 5.0)
-                    if M is not None and mask is not None:
-                        inliers = mask.ravel().sum()
-                        if inliers < 10:  # reject weak homographies
+                boxes_local = []
+                objects_local = 0
+                if len(good_local) >= 8:
+                    dst_pts_loc = np.float32([kp_img[m.trainIdx].pt for m in good_local])
+                    roi_diag = np.hypot(roi_bgr.shape[1], roi_bgr.shape[0])
+                    eps = max(10.0, roi_diag * 0.22)
+                    clustering_loc = DBSCAN(eps=eps, min_samples=6).fit(dst_pts_loc)
+                    labels_loc = clustering_loc.labels_
+                    uniq = set(labels_loc)
+                    if -1 in uniq:
+                        uniq.remove(-1)
+                    for lbl in uniq:
+                        inds = [i for i, lab in enumerate(labels_loc) if lab == lbl]
+                        if len(inds) < 6:
                             continue
-
+                        cluster_matches = [good_local[i] for i in inds]
+                        src_pts = np.float32([kp_roi[m.queryIdx].pt for m in cluster_matches]).reshape(-1, 1, 2)
+                        dst_pts_cluster = np.float32([kp_img[m.trainIdx].pt for m in cluster_matches]).reshape(-1, 1, 2)
+                        M, mask = cv2.findHomography(src_pts, dst_pts_cluster, cv2.RANSAC, 4.0)
+                        if M is None or mask is None:
+                            continue
+                        inliers = int(mask.ravel().sum())
+                        if inliers < 12:
+                            continue
                         h_roi, w_roi = roi_bgr.shape[:2]
                         pts = np.float32([[0,0],[w_roi,0],[w_roi,h_roi],[0,h_roi]]).reshape(-1,1,2)
                         dst = cv2.perspectiveTransform(pts, M)
-
-                        # draw bounding rectangle instead of polygon
                         x, y, w, h = cv2.boundingRect(np.int32(dst))
-                        cv2.rectangle(vis_bgr, (x, y), (x+w, y+h), (0,255,0), 2)
-                        objects_found += 1
+                        roi_area = float(w_roi * h_roi + 1e-6)
+                        scale_sq = (w * h) / roi_area
+                        if scale_sq < 0.30 or scale_sq > 3.8:
+                            continue
+                        aspect_roi = w_roi / (h_roi + 1e-6)
+                        aspect_box = w / (h + 1e-6)
+                        if abs(aspect_box - aspect_roi) / aspect_roi > 0.65:
+                            continue
+                        boxes_local.append([x, y, w, h])
+                        objects_local += 1
+                if boxes_local:
+                    boxes_local = self.non_max_suppression(boxes_local, overlapThresh=0.45)
+                return objects_local, boxes_local, good_local
+
+            # Sweep several ratio candidates and keep the best outcome
+            candidate_ratios = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+            best_score = -1
+            best = (0, [], [], 0.75)
+            for r in candidate_ratios:
+                objs, boxes, good_local = evaluate_with_ratio(r)
+                # score favors more objects and fewer overlaps (via boxes length)
+                score = objs * 1000 + len(good_local)
+                if score > best_score:
+                    best_score = score
+                    best = (objs, boxes, good_local, r)
+
+            objects_found, accepted_boxes, good, chosen_ratio = best
+            # record chosen ratio
+            self.orb_ratio = float(chosen_ratio)
+
+            for (x, y, w, h) in accepted_boxes:
+                cv2.rectangle(vis_bgr, (x, y), (x+w, y+h), (0,255,0), 2)
 
             self.display_image = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
             self.display_image_on_canvas()
@@ -353,7 +595,7 @@ class SmartObjectCounter:
                             f"Keypoints in ROI: {len(kp_roi) if kp_roi is not None else 0}\n"
                             f"Good Matches: {len(good)}\n"
                             f"Objects Found: {objects_found}\n"
-                            f"Ratio Threshold: {self.orb_ratio:.2f}\n")
+                            f"Auto Ratio Threshold: {self.orb_ratio:.2f}\n")
 
         self.results_text.delete(1.0, tk.END)
         self.results_text.insert(tk.END, results_info)
