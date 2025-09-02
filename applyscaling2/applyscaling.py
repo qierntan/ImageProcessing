@@ -54,10 +54,10 @@ class SmartObjectCounter:
         instruction_frame.pack(fill=tk.X, pady=10)
         
         instructions = """
-1. Load an image (objects will be detected automatically)
+1. Load an image (objects will be detected automatically by YOLO)
 2. Click on a highlighted object to select it as reference
 3. Click "Count Objects" to analyze
-4. View results below
+4. Only YOLO-detected objects of the same class will be counted
         """
         ttk.Label(instruction_frame, text=instructions, justify=tk.LEFT).pack(padx=10, pady=10)
         
@@ -429,7 +429,7 @@ class SmartObjectCounter:
                 else:
                     self.highlight_detected_objects()
                     self.object_highlighted = True
-                    messagebox.showinfo("Info", f"Found {len(self.detected_objects)} objects (YOLO). Click one to select as reference.")
+                    messagebox.showinfo("Info", f"Found {len(self.detected_objects)} objects using YOLO. Click one to select as reference. Only objects of the same class will be counted.")
                     return
 
             gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
@@ -461,7 +461,7 @@ class SmartObjectCounter:
 
             self.highlight_detected_objects()
             self.object_highlighted = True
-            messagebox.showinfo("Info", f"Found {len(self.detected_objects)} objects. Click one to select as reference.")
+            messagebox.showinfo("Info", f"Found {len(self.detected_objects)} objects using classical detection. Click one to select as reference.")
 
         except Exception as e:
             messagebox.showerror("Error", f"Error detecting objects: {str(e)}")
@@ -617,7 +617,36 @@ class SmartObjectCounter:
                         if len(sel) > 0:
                             bboxes = [(bx, by, bw, bh) for (bx, by, bw, bh, _, _) in sel]
                             yolo_used = True
+                            print(f"Using YOLO detections for class '{ref_label}': {len(bboxes)} objects")
+                        else:
+                            print(f"No confident YOLO detections found for class '{ref_label}'")
+                    else:
+                        print("Selected ROI doesn't overlap with any YOLO detection")
+                else:
+                    print("No YOLO detections found in image")
             
+            # If YOLO didn't work or no objects found, don't proceed with counting
+            if not yolo_used or len(bboxes) == 0:
+                if self._ensure_yolo():
+                    # YOLO is available but didn't find objects - show message
+                    messagebox.showwarning("Warning", f"Invalid ROI, please try again with a valid ROI.")
+                else:
+                    messagebox.showwarning("Warning", "YOLO model not available. Please ensure YOLO is properly loaded.")
+                
+                # Return zero counts
+                self.results = {
+                    'small': [],
+                    'same': [],
+                    'large': [],
+                    'reference_area': 0,
+                    'no_objects_found': True,
+                    'yolo_used': False,
+                    'reference_label': ref_label
+                }
+                self.display_results()
+                self.draw_results_on_image()
+                return
+
             # Check if any valid objects were found
             if len(bboxes) == 0:
                 # No objects found in the image
@@ -741,7 +770,16 @@ class SmartObjectCounter:
             # Add detailed information
             if self.results.get('yolo_used', False):
                 results_text += f"Filtered by class: {self.results.get('reference_label','')} (YOLO)\n\n"
+            else:
+                results_text += "Used template matching (multi-scale)\n\n"
             results_text += "Detection Settings:\n"
+            if self.results.get('yolo_used', False):
+                results_text += "- YOLO object detection with class filtering\n"
+                results_text += "- Only counting objects detected by YOLO\n"
+                results_text += "- Confidence threshold: 0.25\n"
+            else:
+                results_text += "- Template matching with scales: 0.5x to 3.0x\n"
+                results_text += "- Threshold: 0.6, NMS overlap: 0.3\n"
             results_text += "- Dynamic min area & watershed splitting\n"
             results_text += "- Auto foreground polarity (Otsu)\n"
             results_text += "- Morphology: open(3x3) + close(7x7)\n"
@@ -803,6 +841,98 @@ class SmartObjectCounter:
             # If no objects were detected, just show the original image
             self.display_image = self.original_image.copy()
             self.display_image_on_canvas()
+
+    def _template_match_objects(self, template, image):
+        """Use template matching to find similar objects in the image"""
+        try:
+            # Convert to grayscale
+            template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            
+            # Get template dimensions
+            h, w = template_gray.shape
+            
+            # Define scale range for multi-scale template matching
+            scales = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]
+            threshold = 0.6  # Template matching threshold
+            
+            matches = []
+            
+            for scale in scales:
+                # Resize template
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                
+                if new_w < 10 or new_h < 10 or new_w > image_gray.shape[1] or new_h > image_gray.shape[0]:
+                    continue
+                
+                resized_template = cv2.resize(template_gray, (new_w, new_h))
+                
+                # Perform template matching
+                result = cv2.matchTemplate(image_gray, resized_template, cv2.TM_CCOEFF_NORMED)
+                locations = np.where(result >= threshold)
+                
+                for pt in zip(*locations[::-1]):  # Switch columns and rows
+                    matches.append((pt[0], pt[1], new_w, new_h))
+            
+            # Remove duplicate/overlapping matches using non-maximum suppression
+            if len(matches) > 0:
+                matches = self._non_max_suppression(matches, 0.3)
+            
+            return matches
+            
+        except Exception as e:
+            print(f"Template matching error: {e}")
+            return []
+    
+    def _non_max_suppression(self, boxes, overlap_thresh):
+        """Apply non-maximum suppression to remove overlapping boxes"""
+        if len(boxes) == 0:
+            return []
+        
+        # Convert to numpy array for easier manipulation
+        boxes = np.array(boxes)
+        
+        # Extract coordinates
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = x1 + boxes[:, 2]
+        y2 = y1 + boxes[:, 3]
+        
+        # Compute areas
+        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+        
+        # Sort by bottom-right y-coordinate (and bottom-right x-coordinate)
+        idxs = np.argsort(y2)
+        
+        # Initialize list of picked indexes
+        pick = []
+        
+        while len(idxs) > 0:
+            # Pick the last (bottom-right) box and add it to our list
+            last = len(idxs) - 1
+            i = idxs[last]
+            pick.append(i)
+            
+            # Find the largest (x, y) coordinates for the start of the bounding box
+            # and the smallest (x, y) coordinates for the end of the bounding box
+            xx1 = np.maximum(x1[i], x1[idxs[:last]])
+            yy1 = np.maximum(y1[i], y1[idxs[:last]])
+            xx2 = np.minimum(x2[i], x2[idxs[:last]])
+            yy2 = np.minimum(y2[i], y2[idxs[:last]])
+            
+            # Compute the width and height of the bounding box
+            w = np.maximum(0, xx2 - xx1 + 1)
+            h = np.maximum(0, yy2 - yy1 + 1)
+            
+            # Compute the ratio of overlap
+            overlap = (w * h) / areas[idxs[:last]]
+            
+            # Delete all indexes from the index list that have overlap greater than threshold
+            idxs = np.delete(idxs, np.concatenate(([last], np.where(overlap > overlap_thresh)[0])))
+        
+        # Return only the bounding boxes that were picked
+        return [tuple(boxes[i]) for i in pick]
 
 def main():
     root = tk.Tk()
