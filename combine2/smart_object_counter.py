@@ -63,9 +63,38 @@ class SmartObjectCounter:
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        left_panel = ttk.Frame(main_frame, width=380)
-        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
-        left_panel.pack_propagate(False)
+        # Left panel with scrollbar
+        left_container = ttk.Frame(main_frame, width=380)
+        left_container.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        left_container.pack_propagate(False)
+
+        left_canvas = tk.Canvas(left_container, borderwidth=0, highlightthickness=0)
+        left_scrollbar = ttk.Scrollbar(left_container, orient="vertical", command=left_canvas.yview)
+        left_panel = ttk.Frame(left_canvas)
+
+        left_panel.bind("<Configure>", lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
+        left_panel_window = left_canvas.create_window((0, 0), window=left_panel, anchor="nw")
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
+
+        left_canvas.pack(side="left", fill=tk.BOTH, expand=True)
+        left_scrollbar.pack(side="right", fill="y")
+
+        # Ensure the embedded frame matches canvas width
+        def _on_left_canvas_configure(event):
+            try:
+                left_canvas.itemconfig(left_panel_window, width=event.width)
+            except Exception:
+                pass
+        left_canvas.bind("<Configure>", _on_left_canvas_configure)
+
+        # Mouse wheel scrolling for left panel
+        def _on_left_mousewheel(event):
+            try:
+                delta = int(-1 * (event.delta / 120))
+            except Exception:
+                delta = -1
+            left_canvas.yview_scroll(delta, "units")
+        left_canvas.bind_all("<MouseWheel>", _on_left_mousewheel)
 
         right_panel = ttk.Frame(main_frame)
         right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
@@ -93,11 +122,11 @@ class SmartObjectCounter:
                        value="rectangle", command=self.on_roi_method_change).pack(anchor=tk.W, padx=10, pady=2)
         
         ttk.Button(self.roi_frame, text="Clear", command=self.clear_roi).pack(fill=tk.X, padx=10, pady=5)
-
+        
         # Ready to detect status
         ttk.Label(left_panel, text="Ready to detect", font=("Arial", 10, "bold")).pack(pady=5)
 
-        # Appearance Options Section
+        # Appearance Options Section (should appear directly under ROI)
         self.appearance_frame = ttk.LabelFrame(left_panel, text="Appearance Options")
         self.appearance_frame.pack(fill=tk.X, pady=10)
         
@@ -107,7 +136,9 @@ class SmartObjectCounter:
         ttk.Radiobutton(self.appearance_frame, text="Detect by color matching", 
                        variable=self.detection_method, value="color").pack(anchor=tk.W, padx=10, pady=2)
 
-        # Detection Flexibility Section
+        
+
+        # Detection Flexibility Section (below Appearance)
         self.flexibility_frame = ttk.LabelFrame(left_panel, text="Detection Flexibility")
         self.flexibility_frame.pack(fill=tk.X, pady=10)
         
@@ -118,6 +149,24 @@ class SmartObjectCounter:
                        variable=self.detect_rotated).pack(anchor=tk.W, padx=10, pady=2)
         ttk.Checkbutton(self.flexibility_frame, text="Detect objects of different sizes", 
                        variable=self.detect_scaled).pack(anchor=tk.W, padx=10, pady=2)
+
+        # Ensure order: ROI -> Appearance -> Flexibility
+        try:
+            self.appearance_frame.pack_forget()
+        except Exception:
+            pass
+        try:
+            self.flexibility_frame.pack_forget()
+        except Exception:
+            pass
+        try:
+            self.appearance_frame.pack(fill=tk.X, pady=10, after=self.roi_frame)
+        except Exception:
+            self.appearance_frame.pack(fill=tk.X, pady=10)
+        try:
+            self.flexibility_frame.pack(fill=tk.X, pady=10, after=self.appearance_frame)
+        except Exception:
+            self.flexibility_frame.pack(fill=tk.X, pady=10)
 
         # ---------------- Color Segmentation Section (Scrollable) ----------------
         self.color_frame = ttk.LabelFrame(left_panel, text="Color Segmentation Settings", padding=(8,8,8,8))
@@ -2092,8 +2141,15 @@ class SmartObjectCounter:
             except Exception:
                 pass
         if not is_color:
-            self.appearance_frame.pack(fill=tk.X, pady=10)
-            self.flexibility_frame.pack(fill=tk.X, pady=10)
+            # Keep order: ROI -> Appearance -> Detection Flexibility
+            try:
+                self.appearance_frame.pack(fill=tk.X, pady=10, after=self.roi_frame)
+            except Exception:
+                self.appearance_frame.pack(fill=tk.X, pady=10)
+            try:
+                self.flexibility_frame.pack(fill=tk.X, pady=10, after=self.appearance_frame)
+            except Exception:
+                self.flexibility_frame.pack(fill=tk.X, pady=10)
 
     def _on_color_space_change(self):
         self.use_hsv = (self.color_space_var.get() == 1)
