@@ -43,59 +43,82 @@ class SmartObjectCounter:
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        left_panel = ttk.Frame(main_frame, width=320)
-        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
-        left_panel.pack_propagate(False)
+        # -------- Left Panel with Scrollbar --------
+        left_panel_container = ttk.Frame(main_frame, width=320)
+        left_panel_container.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        left_panel_container.pack_propagate(False)
 
+        # Canvas + Scrollbar
+        canvas = tk.Canvas(left_panel_container, borderwidth=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(left_panel_container, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # -------- Right Panel --------
         right_panel = ttk.Frame(main_frame)
         right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        # Controls
-        ttk.Button(left_panel, text="Load Image", command=self.load_image).pack(fill=tk.X, pady=4)
-        ttk.Button(left_panel, text="Count Objects", command=self.count_objects).pack(fill=tk.X, pady=4)
-        ttk.Button(left_panel, text="Reset", command=self.reset).pack(fill=tk.X, pady=4)
-        ttk.Button(left_panel, text="Save Result", command=self.save_result).pack(fill=tk.X, pady=4)
+        # ---------- Controls go inside scrollable_frame ----------
+        ttk.Button(scrollable_frame, text="Load Image", command=self.load_image).pack(fill=tk.X, pady=4)
+        ttk.Button(scrollable_frame, text="Count Objects", command=self.count_objects).pack(fill=tk.X, pady=4)
+        ttk.Button(scrollable_frame, text="Reset", command=self.reset).pack(fill=tk.X, pady=4)
+        ttk.Button(scrollable_frame, text="Save Result", command=self.save_result).pack(fill=tk.X, pady=4)
 
         # ROI Selection Section
-        roi_frame = ttk.LabelFrame(left_panel, text="ROI Selection")
+        roi_frame = ttk.LabelFrame(scrollable_frame, text="ROI Selection")
         roi_frame.pack(fill=tk.X, pady=10)
-        
+
         self.roi_method = tk.StringVar(value="auto")
-        ttk.Radiobutton(roi_frame, text="Auto Detection (YOLO)", variable=self.roi_method, 
+        ttk.Radiobutton(roi_frame, text="Auto Detection (YOLO)", variable=self.roi_method,
                     value="auto", command=self.on_roi_method_change).pack(anchor=tk.W, padx=10, pady=2)
-        ttk.Radiobutton(roi_frame, text="Rectangle (drag)", variable=self.roi_method, 
+        ttk.Radiobutton(roi_frame, text="Rectangle (drag)", variable=self.roi_method,
                     value="rectangle", command=self.on_roi_method_change).pack(anchor=tk.W, padx=10, pady=2)
-        
+
         ttk.Button(roi_frame, text="Clear", command=self.clear_roi).pack(fill=tk.X, padx=10, pady=5)
 
-        # Detection Method Section (only for manual ROI)
-        self.appearance_frame = ttk.LabelFrame(left_panel, text="Detection Method")
+        # Detection Method Section
+        self.appearance_frame = ttk.LabelFrame(scrollable_frame, text="Detection Method")
         self.appearance_frame.pack(fill=tk.X, pady=10)
-        
+
         self.detection_method = tk.StringVar(value="grayscale")
-        self.radio_gray = ttk.Radiobutton(self.appearance_frame, text="Grayscale Matching", 
+        self.radio_gray = ttk.Radiobutton(self.appearance_frame, text="Grayscale Matching",
                         variable=self.detection_method, value="grayscale", command=self.on_detection_method_change)
         self.radio_gray.pack(anchor=tk.W, padx=10, pady=2)
-        self.radio_color = ttk.Radiobutton(self.appearance_frame, text="Color Matching", 
+        self.radio_color = ttk.Radiobutton(self.appearance_frame, text="Color Matching",
                         variable=self.detection_method, value="color", command=self.on_detection_method_change)
         self.radio_color.pack(anchor=tk.W, padx=10, pady=2)
 
-        # Detection Flexibility Section (only for grayscale)
-        self.flexibility_frame = ttk.LabelFrame(left_panel, text="Detection Flexibility")
+        # Flexibility Section
+        self.flexibility_frame = ttk.LabelFrame(scrollable_frame, text="Detection Flexibility")
         self.flexibility_frame.pack(fill=tk.X, pady=10)
-        
+
         self.detect_rotated = tk.BooleanVar(value=True)
         self.detect_scaled = tk.BooleanVar(value=True)
-        
-        self.check_rotated = ttk.Checkbutton(self.flexibility_frame, text="Detect rotated objects", 
+
+        self.check_rotated = ttk.Checkbutton(self.flexibility_frame, text="Detect rotated objects",
                         variable=self.detect_rotated)
         self.check_rotated.pack(anchor=tk.W, padx=10, pady=2)
-        self.check_scaled = ttk.Checkbutton(self.flexibility_frame, text="Detect objects of different sizes", 
+        self.check_scaled = ttk.Checkbutton(self.flexibility_frame, text="Detect objects of different sizes",
                         variable=self.detect_scaled)
         self.check_scaled.pack(anchor=tk.W, padx=10, pady=2)
 
         # Instructions
-        instruction_frame = ttk.LabelFrame(left_panel, text="Instructions")
+        instruction_frame = ttk.LabelFrame(scrollable_frame, text="Instructions")
         instruction_frame.pack(fill=tk.X, pady=10)
         instructions = """
 1. Load an image 
@@ -107,9 +130,9 @@ class SmartObjectCounter:
         ttk.Label(instruction_frame, text=instructions, justify=tk.LEFT).pack(padx=10, pady=8)
 
         # Results Display
-        results_frame = ttk.LabelFrame(left_panel, text="Results")
-        results_frame.pack(fill=tk.BOTH, pady=10, expand=False)
-        self.results_text = tk.Text(results_frame, height=12, width=36)
+        results_frame = ttk.LabelFrame(scrollable_frame, text="Results")
+        results_frame.pack(fill=tk.BOTH, pady=10, expand=True)
+        self.results_text = tk.Text(results_frame, height=12, width=36, font=("Consolas", 10))
         self.results_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # Image canvas
