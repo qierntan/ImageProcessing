@@ -911,7 +911,10 @@ class SmartObjectCounter:
             self.count_objects_with_yolo()
             return
         
-        # Rectangle (drag) should not rely on YOLO; proceed with ORB/Template pipeline
+        # For rectangle mode, also try to use YOLO if available for better object detection
+        if self.roi_method.get() == "rectangle" and self._ensure_yolo():
+            self.count_objects_with_yolo_rectangle_mode()
+            return
         
         # Check which detection methods are enabled
         detect_rotated = self.detect_rotated.get()
@@ -957,12 +960,12 @@ class SmartObjectCounter:
             
             # Configure rotation and scaling based on user settings
             if self.detect_rotated.get():
-                angles = range(0, 360, 8)
+                angles = range(0, 360, 8)  # 8-degree increments for rotation detection
             else:
                 angles = [0]  # No rotation detection
                 
             if self.detect_scaled.get():
-                scales = [0.60, 0.70, 0.80, 0.90, 1.0, 1.1, 1.2, 1.3, 1.4]
+                scales = [0.60, 0.70, 0.80, 0.90, 1.0, 1.1, 1.2, 1.3, 1.4]  # Scale variations
             else:
                 scales = [1.0]  # No scaling detection
 
@@ -1006,7 +1009,7 @@ class SmartObjectCounter:
                     for y, x in zip(ys, xs):
                         rectangles.append([x, y, scaled_w, scaled_h])
                 
-                # Also try flipped version for mirrored objects
+                # Also try horizontally flipped version if rotation is enabled
                 if self.detect_rotated.get():
                     flipped_roi = cv2.flip(rotated_roi if angle != 0 else roi_bgr, 1)
                     flipped_gray = cv2.cvtColor(flipped_roi, cv2.COLOR_BGR2GRAY)
@@ -1235,28 +1238,9 @@ class SmartObjectCounter:
                         best_overlap = overlap_ratio
                         best_obj = obj
             
-            if best_obj is None or best_overlap < 0.05:  # If no reasonable overlap, fall back to template matching
-                # Fallback: run the same template-matching pipeline used elsewhere, honoring checkboxes
-                # Gather ROI and current detection settings
-                x1, y1, x2, y2 = self.selected_roi
-                roi_bgr = self.original_image[y1:y2, x1:x2]
-                detection_method = self.detection_method.get()
-
-                detect_rotated = self.detect_rotated.get()
-                detect_scaled = self.detect_scaled.get()
-
-                if detect_rotated and detect_scaled:
-                    self.count_objects_combined_rotation_scaling(roi_bgr, detection_method)
-                    return
-                elif detect_rotated:
-                    self.count_objects_rotation_only(roi_bgr, detection_method)
-                    return
-                elif detect_scaled:
-                    self.count_objects_scaling_only(roi_bgr, detection_method)
-                    return
-                else:
-                    self.count_objects_basic(roi_bgr, detection_method)
-                    return
+            if best_obj is None or best_overlap < 0.05:  # Lowered from 0.1 to 0.05 for better detection
+                messagebox.showwarning("Warning", "Selected ROI doesn't overlap with any YOLO detection")
+                return
             
             ref_label = best_obj['label']
             
@@ -1366,92 +1350,20 @@ class SmartObjectCounter:
             # Calculate reference area
             ref_area = (ref_x2 - ref_x1) * (ref_y2 - ref_y1)
             
-            # Augment YOLO with ORB based on selected ROI to catch misses
-            orb_rects = []
-            try:
-                roi_sel = self.original_image[ref_y1:ref_y2, ref_x1:ref_x2]
-                orb = cv2.ORB_create(nfeatures=1500)
-                kp_roi, des_roi = orb.detectAndCompute(roi_sel, None)
-                img_gray_orb = self.preprocess_gray(self.original_image)
-                kp_img, des_img = orb.detectAndCompute(img_gray_orb, None)
-                if des_roi is not None and des_img is not None and kp_roi is not None and len(kp_roi) >= 20:
-                    index_params = dict(algorithm=6, table_number=6, key_size=12, multi_probe_level=2)
-                    search_params = dict(checks=80)
-                    flann = cv2.FlannBasedMatcher(index_params, search_params)
-                    try:
-                        matches_knn = flann.knnMatch(des_roi, des_img, k=2)
-                    except Exception:
-                        matches_knn = []
-                    def rects_for_ratio(ratio):
-                        good_local = []
-                        for m_n in matches_knn:
-                            if len(m_n) != 2:
-                                continue
-                            m, n = m_n
-                            if m.distance < ratio * n.distance:
-                                good_local.append(m)
-                        rects = []
-                        if len(good_local) >= 8:
-                            dst_pts = np.float32([kp_img[m.trainIdx].pt for m in good_local])
-                            roi_diag = float(np.hypot(roi_sel.shape[1], roi_sel.shape[0]))
-                            eps = max(8.0, roi_diag * 0.20)
-                            clustering = DBSCAN(eps=eps, min_samples=6).fit(dst_pts)
-                            labels = clustering.labels_
-                            uniq = set(labels)
-                            if -1 in uniq:
-                                uniq.remove(-1)
-                            for lbl in uniq:
-                                inds = [i for i, lab in enumerate(labels) if lab == lbl]
-                                if len(inds) < 6:
-                                    continue
-                                cluster_matches = [good_local[i] for i in inds]
-                                src_pts = np.float32([kp_roi[m.queryIdx].pt for m in cluster_matches]).reshape(-1, 1, 2)
-                                dst_pts_cluster = np.float32([kp_img[m.trainIdx].pt for m in cluster_matches]).reshape(-1, 1, 2)
-                                M, mask = cv2.findHomography(src_pts, dst_pts_cluster, cv2.RANSAC, 3.0)
-                                if M is None or mask is None:
-                                    continue
-                                inliers = int(mask.ravel().sum())
-                                if inliers < 12:
-                                    continue
-                                h_roi, w_roi = roi_sel.shape[:2]
-                                pts = np.float32([[0,0],[w_roi,0],[w_roi,h_roi],[0,h_roi]]).reshape(-1,1,2)
-                                dst = cv2.perspectiveTransform(pts, M)
-                                x, y, w, h = cv2.boundingRect(np.int32(dst))
-                                rects.append((x, y, w, h))
-                        return rects
-                    best = []
-                    for r in [0.60,0.65,0.70,0.75,0.80]:
-                        rects = rects_for_ratio(r)
-                        if len(rects) > len(best):
-                            best = rects
-                    orb_rects = self.non_max_suppression(best, overlapThresh=0.45) if best else []
-            except Exception:
-                orb_rects = []
-
-            # Merge YOLO class-filtered boxes with ORB boxes
-            merged = [(x, y, w, h) for (x, y, w, h, _, _) in same_class_objects]
-            merged.extend(orb_rects)
-            if merged:
-                merged = self.non_max_suppression(merged, overlapThresh=0.45)
-
             # Display results
-            results_info = f"Method used: YOLO + ORB Augmentation\n"
+            results_info = f"Method used: YOLO Detection\n"
             results_info += f"Detection: {self.detection_method.get()}\n"
             results_info += f"Rotation: {'Enabled' if self.detect_rotated.get() else 'Disabled'}\n"
             results_info += f"Scaling: {'Enabled' if self.detect_scaled.get() else 'Disabled'}\n"
             results_info += f"Reference Class: {ref_label}\n"
             results_info += f"Reference Area: {ref_area:.1f} pixels\n\n"
-            results_info += f"YOLO matches: {len(same_class_objects)} | ORB matches: {len(orb_rects)} | Merged: {len(merged)}\n"
-
+            results_info += f"Total Objects Found: {len(same_class_objects)}\n"
+            
             self.results_text.delete(1.0, tk.END)
             self.results_text.insert(tk.END, results_info)
-
-            vis = self.original_image.copy()
-            for (x, y, w, h) in merged:
-                cv2.rectangle(vis, (x, y), (x+w, y+h), (255, 0, 0), 2)
-            cv2.rectangle(vis, (ref_x1, ref_y1), (ref_x2, ref_y2), (0,255,0), 2)
-            self.display_image = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
-            self.display_image_on_canvas()
+            
+            # Draw results on image - just highlight all objects of the same class
+            self.draw_simple_results(same_class_objects)
             
         except Exception as e:
             messagebox.showerror("Error", f"Error counting objects with YOLO: {str(e)}")
@@ -1476,7 +1388,7 @@ class SmartObjectCounter:
             used_thresholds = []
             
             # Only rotation detection (no scaling)
-            angles = range(0, 360, 8)
+            angles = range(0, 360, 8)  # 8-degree increments for rotation detection
             scales = [1.0]  # No scaling detection
             
             for angle in angles:
@@ -1520,29 +1432,29 @@ class SmartObjectCounter:
                 # Also try horizontally flipped version
                 flipped_roi = cv2.flip(rotated_roi if angle != 0 else roi_bgr, 1)
                 flipped_gray = cv2.cvtColor(flipped_roi, cv2.COLOR_BGR2GRAY)
-
+                
                 for scale in scales:
-                        scaled_w = int(flipped_gray.shape[1] * scale)
-                        scaled_h = int(flipped_gray.shape[0] * scale)
-                        
-                        scaled_flipped_gray = cv2.resize(flipped_gray, (scaled_w, scaled_h))
-                        res_flipped = cv2.matchTemplate(img_gray, scaled_flipped_gray, cv2.TM_CCOEFF_NORMED)
-                        
-                        auto_thr_flipped = self.compute_auto_template_threshold(res_flipped)
-                        if is_uniform:
-                            auto_thr_flipped = max(0.35, auto_thr_flipped - 0.12)
-                        
-                        used_thresholds.append(auto_thr_flipped)
-                        
-                        kh = max(2, int(round(scaled_h * 0.06))) if is_uniform else max(3, int(round(scaled_h * 0.08)))
-                        kw = max(2, int(round(scaled_w * 0.06))) if is_uniform else max(3, int(round(scaled_w * 0.08)))
-                        kernel = np.ones((kh, kw), np.uint8)
-                        res_dil = cv2.dilate(res_flipped, kernel)
-                        maxima = (res_flipped >= auto_thr_flipped) & (res_flipped == res_dil)
-                        ys, xs = np.where(maxima)
-                        
-                        for y, x in zip(ys, xs):
-                            rectangles.append([x, y, scaled_w, scaled_h])
+                    scaled_w = int(flipped_gray.shape[1] * scale)
+                    scaled_h = int(flipped_gray.shape[0] * scale)
+                    
+                    scaled_flipped_gray = cv2.resize(flipped_gray, (scaled_w, scaled_h))
+                    res_flipped = cv2.matchTemplate(img_gray, scaled_flipped_gray, cv2.TM_CCOEFF_NORMED)
+                    
+                    auto_thr_flipped = self.compute_auto_template_threshold(res_flipped)
+                    if is_uniform:
+                        auto_thr_flipped = max(0.35, auto_thr_flipped - 0.12)
+                    
+                    used_thresholds.append(auto_thr_flipped)
+                    
+                    kh = max(2, int(round(scaled_h * 0.06))) if is_uniform else max(3, int(round(scaled_h * 0.08)))
+                    kw = max(2, int(round(scaled_w * 0.06))) if is_uniform else max(3, int(round(scaled_w * 0.08)))
+                    kernel = np.ones((kh, kw), np.uint8)
+                    res_dil = cv2.dilate(res_flipped, kernel)
+                    maxima = (res_flipped >= auto_thr_flipped) & (res_flipped == res_dil)
+                    ys, xs = np.where(maxima)
+                    
+                    for y, x in zip(ys, xs):
+                        rectangles.append([x, y, scaled_w, scaled_h])
 
             # Group and filter rectangles
             if rectangles:
@@ -1716,104 +1628,13 @@ class SmartObjectCounter:
                 img_gray = cv2.cvtColor(img_gray, cv2.COLOR_BGR2GRAY)
                 roi_gray = cv2.cvtColor(roi_hsv, cv2.COLOR_HSV2BGR)
 
-            # ORB-first attempt (rotation/scale invariant) with ratio sweep & clustering
-            try:
-                orb = cv2.ORB_create(nfeatures=1500)
-                kp_roi, des_roi = orb.detectAndCompute(roi_bgr, None)
-                img_gray_orb = self.preprocess_gray(self.original_image)
-                kp_img, des_img = orb.detectAndCompute(img_gray_orb, None)
-            except Exception:
-                kp_roi, des_roi, kp_img, des_img = None, None, None, None
-
-            if des_roi is not None and des_img is not None and kp_roi is not None and len(kp_roi) >= 20:
-                index_params = dict(algorithm=6, table_number=6, key_size=12, multi_probe_level=2)
-                search_params = dict(checks=80)
-                flann = cv2.FlannBasedMatcher(index_params, search_params)
-                try:
-                    matches_knn = flann.knnMatch(des_roi, des_img, k=2)
-                except Exception:
-                    matches_knn = []
-
-                def rects_for_ratio(ratio: float):
-                    good_local = []
-                    for m_n in matches_knn:
-                        if len(m_n) != 2:
-                            continue
-                        m, n = m_n
-                        if m.distance < ratio * n.distance:
-                            good_local.append(m)
-                    rects = []
-                    if len(good_local) >= 8:
-                        dst_pts = np.float32([kp_img[m.trainIdx].pt for m in good_local])
-                        roi_diag = float(np.hypot(roi_bgr.shape[1], roi_bgr.shape[0]))
-                        eps = max(8.0, roi_diag * 0.20)
-                        clustering = DBSCAN(eps=eps, min_samples=6).fit(dst_pts)
-                        labels = clustering.labels_
-                        uniq = set(labels)
-                        if -1 in uniq:
-                            uniq.remove(-1)
-                        for lbl in uniq:
-                            inds = [i for i, lab in enumerate(labels) if lab == lbl]
-                            if len(inds) < 6:
-                                continue
-                            cluster_matches = [good_local[i] for i in inds]
-                            src_pts = np.float32([kp_roi[m.queryIdx].pt for m in cluster_matches]).reshape(-1, 1, 2)
-                            dst_pts_cluster = np.float32([kp_img[m.trainIdx].pt for m in cluster_matches]).reshape(-1, 1, 2)
-                            M, mask = cv2.findHomography(src_pts, dst_pts_cluster, cv2.RANSAC, 3.0)
-                            if M is None or mask is None:
-                                continue
-                            inliers = int(mask.ravel().sum())
-                            if inliers < 12:
-                                continue
-                            h_roi, w_roi = roi_bgr.shape[:2]
-                            pts = np.float32([[0,0],[w_roi,0],[w_roi,h_roi],[0,h_roi]]).reshape(-1,1,2)
-                            dst = cv2.perspectiveTransform(pts, M)
-                            x, y, w, h = cv2.boundingRect(np.int32(dst))
-                            # sanity checks for scale/aspect
-                            roi_area = float(max(1, w_roi * h_roi))
-                            scale_sq = (w * h) / roi_area
-                            if scale_sq < 0.30 or scale_sq > 3.8:
-                                continue
-                            aspect_roi = w_roi / (h_roi + 1e-6)
-                            aspect_box = w / (h + 1e-6)
-                            if abs(aspect_box - aspect_roi) / max(1e-6, aspect_roi) > 0.65:
-                                continue
-                            rects.append((x, y, w, h))
-                    return rects, len(good_local)
-
-                candidate_ratios = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
-                best_rects = []
-                best_score = -1
-                for r in candidate_ratios:
-                    rects, good_count = rects_for_ratio(r)
-                    score = len(rects) * 1000 + good_count
-                    if score > best_score:
-                        best_score = score
-                        best_rects = rects
-
-                if best_rects:
-                    best_rects = self.non_max_suppression(best_rects, overlapThresh=0.45)
-                    vis_bgr = self.original_image.copy()
-                    for (x, y, w, h) in best_rects:
-                        cv2.rectangle(vis_bgr, (x, y), (x + w, y + h), (0,255,0), 2)
-                    self.display_image = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
-                    self.display_image_on_canvas()
-                    results_info = (f"Method used: ORB (FLANN)\n"
-                                    f"Detection: {detection_method}\n"
-                                    f"Rotation: {'Enabled' if self.detect_rotated.get() else 'Disabled'}\n"
-                                    f"Scaling: {'Enabled' if self.detect_scaled.get() else 'Disabled'}\n"
-                                    f"Objects Found: {len(best_rects)}\n")
-                    self.results_text.delete(1.0, tk.END)
-                    self.results_text.insert(tk.END, results_info)
-                    return
-
             # Template Matching with BOTH rotation AND scaling
             rectangles = []
             used_thresholds = []
             
             # Both rotation and scaling detection enabled
-            angles = range(0, 360, 8)
-            scales = [0.60, 0.70, 0.80, 0.90, 1.0, 1.1, 1.2, 1.3, 1.4]
+            angles = range(0, 360, 8)  # 8-degree increments for rotation detection
+            scales = [0.60, 0.70, 0.80, 0.90, 1.0, 1.1, 1.2, 1.3, 1.4]  # Scale variations
             
             for angle in angles:
                 if angle != 0:
@@ -1858,31 +1679,31 @@ class SmartObjectCounter:
                 # Also try horizontally flipped version
                 flipped_roi = cv2.flip(rotated_roi if angle != 0 else roi_bgr, 1)
                 flipped_gray = cv2.cvtColor(flipped_roi, cv2.COLOR_BGR2GRAY)
-
+                
                 for scale in scales:
-                        scaled_w = int(flipped_gray.shape[1] * scale)
-                        scaled_h = int(flipped_gray.shape[0] * scale)
-                        if scaled_w < 10 or scaled_h < 10:
-                            continue
-                        
-                        scaled_flipped_gray = cv2.resize(flipped_gray, (scaled_w, scaled_h))
-                        res_flipped = cv2.matchTemplate(img_gray, scaled_flipped_gray, cv2.TM_CCOEFF_NORMED)
-                        
-                        auto_thr_flipped = self.compute_auto_template_threshold(res_flipped)
-                        if is_uniform:
-                            auto_thr_flipped = max(0.35, auto_thr_flipped - 0.12)
-                        
-                        used_thresholds.append(auto_thr_flipped)
-                        
-                        kh = max(2, int(round(scaled_h * 0.06))) if is_uniform else max(3, int(round(scaled_h * 0.08)))
-                        kw = max(2, int(round(scaled_w * 0.06))) if is_uniform else max(3, int(round(scaled_w * 0.08)))
-                        kernel = np.ones((kh, kw), np.uint8)
-                        res_dil = cv2.dilate(res_flipped, kernel)
-                        maxima = (res_flipped >= auto_thr_flipped) & (res_flipped == res_dil)
-                        ys, xs = np.where(maxima)
-                        
-                        for y, x in zip(ys, xs):
-                            rectangles.append([x, y, scaled_w, scaled_h])
+                    scaled_w = int(flipped_gray.shape[1] * scale)
+                    scaled_h = int(flipped_gray.shape[0] * scale)
+                    if scaled_w < 10 or scaled_h < 10:
+                        continue
+                    
+                    scaled_flipped_gray = cv2.resize(flipped_gray, (scaled_w, scaled_h))
+                    res_flipped = cv2.matchTemplate(img_gray, scaled_flipped_gray, cv2.TM_CCOEFF_NORMED)
+                    
+                    auto_thr_flipped = self.compute_auto_template_threshold(res_flipped)
+                    if is_uniform:
+                        auto_thr_flipped = max(0.35, auto_thr_flipped - 0.12)
+                    
+                    used_thresholds.append(auto_thr_flipped)
+                    
+                    kh = max(2, int(round(scaled_h * 0.06))) if is_uniform else max(3, int(round(scaled_h * 0.08)))
+                    kw = max(2, int(round(scaled_w * 0.06))) if is_uniform else max(3, int(round(scaled_w * 0.08)))
+                    kernel = np.ones((kh, kw), np.uint8)
+                    res_dil = cv2.dilate(res_flipped, kernel)
+                    maxima = (res_flipped >= auto_thr_flipped) & (res_flipped == res_dil)
+                    ys, xs = np.where(maxima)
+                    
+                    for y, x in zip(ys, xs):
+                        rectangles.append([x, y, scaled_w, scaled_h])
 
             # Group and filter rectangles
             if rectangles:
