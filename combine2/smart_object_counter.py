@@ -67,9 +67,12 @@ class SmartObjectCounter:
         left_container = ttk.Frame(main_frame, width=380)
         left_container.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         left_container.pack_propagate(False)
+        # Keep a fixed visual height so overflow content uses the scrollbar
+        left_container.configure(height=600)
 
         left_canvas = tk.Canvas(left_container, borderwidth=0, highlightthickness=0)
-        left_scrollbar = ttk.Scrollbar(left_container, orient="vertical", command=left_canvas.yview)
+        # Use classic Tk scrollbar with larger width for visibility
+        left_scrollbar = tk.Scrollbar(left_container, orient="vertical", command=left_canvas.yview, width=16)
         left_panel = ttk.Frame(left_canvas)
 
         left_panel.bind("<Configure>", lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
@@ -86,6 +89,14 @@ class SmartObjectCounter:
             except Exception:
                 pass
         left_canvas.bind("<Configure>", _on_left_canvas_configure)
+
+        # Keep left sidebar height synced with the window height for scrolling
+        def _sync_left_height(event):
+            try:
+                left_container.configure(height=event.height)
+            except Exception:
+                pass
+        main_frame.bind("<Configure>", _sync_left_height)
 
         # Mouse wheel scrolling for left panel
         def _on_left_mousewheel(event):
@@ -126,17 +137,10 @@ class SmartObjectCounter:
         # Ready to detect status
         ttk.Label(left_panel, text="Ready to detect", font=("Arial", 10, "bold")).pack(pady=5)
 
-        # Appearance Options Section (should appear directly under ROI)
-        self.appearance_frame = ttk.LabelFrame(left_panel, text="Appearance Options")
-        self.appearance_frame.pack(fill=tk.X, pady=10)
-        
+        # Always use grayscale detection without showing an appearance options section
         self.detection_method = tk.StringVar(value="grayscale")
-        ttk.Radiobutton(self.appearance_frame, text="Detect by grayscale matching", 
-                       variable=self.detection_method, value="grayscale").pack(anchor=tk.W, padx=10, pady=2)
 
-        
-
-        # Detection Flexibility Section (below Appearance)
+        # Detection Flexibility Section
         self.flexibility_frame = ttk.LabelFrame(left_panel, text="Detection Flexibility")
         self.flexibility_frame.pack(fill=tk.X, pady=10)
         
@@ -148,21 +152,13 @@ class SmartObjectCounter:
         ttk.Checkbutton(self.flexibility_frame, text="Detect objects of different sizes", 
                        variable=self.detect_scaled).pack(anchor=tk.W, padx=10, pady=2)
 
-        # Ensure order: ROI -> Appearance -> Flexibility
-        try:
-            self.appearance_frame.pack_forget()
-        except Exception:
-            pass
+        # Ensure order: ROI -> Flexibility (appearance options removed)
         try:
             self.flexibility_frame.pack_forget()
         except Exception:
             pass
         try:
-            self.appearance_frame.pack(fill=tk.X, pady=10, after=self.roi_frame)
-        except Exception:
-            self.appearance_frame.pack(fill=tk.X, pady=10)
-        try:
-            self.flexibility_frame.pack(fill=tk.X, pady=10, after=self.appearance_frame)
+            self.flexibility_frame.pack(fill=tk.X, pady=10, after=self.roi_frame)
         except Exception:
             self.flexibility_frame.pack(fill=tk.X, pady=10)
 
@@ -172,7 +168,8 @@ class SmartObjectCounter:
 
         # Create a canvas + scrollbar inside color_frame
         self.color_canvas = tk.Canvas(self.color_frame, borderwidth=0, highlightthickness=0)
-        self.color_scrollbar = ttk.Scrollbar(self.color_frame, orient="vertical", command=self.color_canvas.yview)
+        # Make the color section scrollbar more visible
+        self.color_scrollbar = tk.Scrollbar(self.color_frame, orient="vertical", command=self.color_canvas.yview, width=16)
         self.color_inner = ttk.Frame(self.color_canvas)
 
         self.color_inner.bind("<Configure>", lambda e: self.color_canvas.configure(scrollregion=self.color_canvas.bbox("all")))
@@ -255,8 +252,8 @@ class SmartObjectCounter:
         instructions = """
 1. Load an image 
 2. Choose ROI method (auto detection or drag rectangle)
-3. Select detection options
-4. Click "Count Objects" to analyze
+3. Optionally adjust detection flexibility (rotation/scale)
+4. Click \"Count Objects\" to analyze
 5. Save annotated result if needed
         """
         ttk.Label(instruction_frame, text=instructions, justify=tk.LEFT).pack(padx=10, pady=8)
@@ -616,6 +613,11 @@ class SmartObjectCounter:
             return
 
         self.original_image = img_bgr.copy()       # keep BGR for processing
+        # Also prepare grayscale immediately for downstream processing
+        try:
+            self.original_gray = self.preprocess_gray(self.original_image)
+        except Exception:
+            self.original_gray = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
         self.image = cv2.cvtColor(img_bgr.copy(), cv2.COLOR_BGR2RGB)  # RGB for display
         self.display_image = self.image.copy()
 
@@ -1879,19 +1881,14 @@ class SmartObjectCounter:
         if is_color:
             self.color_frame.pack(fill=tk.BOTH, pady=10, expand=True)
         # Template-only sections visibility (ROI is always visible)
-        for frame in [self.appearance_frame, self.flexibility_frame]:
+        for frame in [self.flexibility_frame]:
             try:
                 frame.pack_forget()
             except Exception:
                 pass
         if not is_color:
-            # Keep order: ROI -> Appearance -> Detection Flexibility
             try:
-                self.appearance_frame.pack(fill=tk.X, pady=10, after=self.roi_frame)
-            except Exception:
-                self.appearance_frame.pack(fill=tk.X, pady=10)
-            try:
-                self.flexibility_frame.pack(fill=tk.X, pady=10, after=self.appearance_frame)
+                self.flexibility_frame.pack(fill=tk.X, pady=10, after=self.roi_frame)
             except Exception:
                 self.flexibility_frame.pack(fill=tk.X, pady=10)
 
