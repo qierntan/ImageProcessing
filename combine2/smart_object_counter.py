@@ -897,13 +897,16 @@ class SmartObjectCounter:
         detect_scaled = self.detect_scaled.get()
         
         # Apply different logic based on checkbox selections
-        if detect_rotated or detect_scaled:
-            # If any detection flexibility is enabled, use the combined method
-            # This ensures that rotation and scaling detection work independently
+        if detect_rotated and detect_scaled:
             self.count_objects_combined_rotation_scaling(roi_bgr, detection_method)
             return
+        elif detect_rotated:
+             self.count_objects_rotation_only(roi_bgr, detection_method)
+             return
+        elif detect_scaled:
+             self.count_objects_scaling_only(roi_bgr, detection_method)
+             return
         else:
-            # Neither enabled: use basic template matching
             self.count_objects_basic(roi_bgr, detection_method)
             return
 
@@ -1357,85 +1360,51 @@ class SmartObjectCounter:
             self.results_text.delete(1.0, tk.END)
             self.results_text.insert(tk.END, results_info)
         except Exception as e:
-            messagebox.showerror("Error", f"Error in rotation-only detection: {str(e)}")
+            messagebox.showerror("Error", f"No matches found with selected rotation settings.")
 
     def count_objects_scaling_only(self, roi_bgr, detection_method):
-        """Apply only scaling detection logic (from apply_rotation.py)"""
+        """Apply only scaling detection logic"""
         try:
             # Convert original image and ROI based on detection method
             if detection_method == "grayscale":
                 img_gray = self.preprocess_gray(self.original_image)
                 roi_gray = self.preprocess_gray(roi_bgr)
+            else:
+                 raise ValueError("Unsupported detection method for this function.")
 
-            # Template Matching with scaling ONLY (no rotation)
-            rectangles = []
+            all_rectangles = []
             used_thresholds = []
-            
-            # Only scaling detection (no rotation)
-            angles = [0]  # No rotation detection
-            scales = [0.60, 0.70, 0.80, 0.90, 1.0, 1.1, 1.2, 1.3, 1.4]  # Scale variations
-            
-            for angle in angles:
-                rotated_gray = roi_gray  # No rotation
-                
-                for scale in scales:
-                    scaled_w = int(rotated_gray.shape[1] * scale)
-                    scaled_h = int(rotated_gray.shape[0] * scale)
-                    
-                    scaled_roi_gray = cv2.resize(rotated_gray, (scaled_w, scaled_h))
-                    res = cv2.matchTemplate(img_gray, scaled_roi_gray, cv2.TM_CCOEFF_NORMED)
-                    
-                    # Check if we're likely dealing with uniform objects
-                    res_mean = np.mean(res)
-                    res_std = np.std(res)
-                    is_uniform = res_mean > 0.15 and res_std < 0.2
-                    
-                    # Use robust map-based threshold
-                    auto_thr = self.compute_auto_template_threshold(res)
-                    
-                    # For uniform objects, be more aggressive
-                    if is_uniform:
-                        auto_thr = max(0.35, auto_thr - 0.12)
-                    
-                    used_thresholds.append(auto_thr)
-                    
-                    # Local maxima to avoid clusters
-                    kh = max(2, int(round(scaled_h * 0.06))) if is_uniform else max(3, int(round(scaled_h * 0.08)))
-                    kw = max(2, int(round(scaled_w * 0.06))) if is_uniform else max(3, int(round(scaled_w * 0.08)))
-                    kernel = np.ones((kh, kw), np.uint8)
-                    res_dil = cv2.dilate(res, kernel)
-                    maxima = (res >= auto_thr) & (res == res_dil)
-                    ys, xs = np.where(maxima)
-                    for y, x in zip(ys, xs):
-                        rectangles.append([x, y, scaled_w, scaled_h])
 
-            # Group and filter rectangles
-            if rectangles:
-                is_uniform = len(rectangles) > 20
+            # Use a comprehensive range of scales
+            scales = np.linspace(0.6, 1.4, 25) # Increased number of steps for better coverage
+
+            for scale in scales:
+                scaled_w = int(roi_gray.shape[1] * scale)
+                scaled_h = int(roi_gray.shape[0] * scale)
                 
-                if is_uniform:
-                    rectangles, _ = cv2.groupRectangles(rectangles, groupThreshold=1, eps=0.7)
-                    rectangles = self.non_max_suppression(rectangles, overlapThresh=0.45)
-                else:
-                    rectangles, _ = cv2.groupRectangles(rectangles, groupThreshold=1, eps=0.5)
-                    rectangles = self.non_max_suppression(rectangles, overlapThresh=0.3)
+                # Skip if the scaled ROI is too small or too large
+                if scaled_w < 10 or scaled_h < 10 or scaled_w > img_gray.shape[1] or scaled_h > img_gray.shape[0]:
+                    continue
+                    
+                scaled_roi_gray = cv2.resize(roi_gray, (scaled_w, scaled_h))
+                res = cv2.matchTemplate(img_gray, scaled_roi_gray, cv2.TM_CCOEFF_NORMED)
+                
+                # Use robust auto threshold, but with a minimum value
+                auto_thr = self.compute_auto_template_threshold(res)
+                final_thr = max(0.5, auto_thr) # Ensure threshold is not too high
+                used_thresholds.append(final_thr)
+
+                # Find all locations above the dynamic threshold
+                loc = np.where(res >= final_thr)
+                for pt in zip(*loc[::-1]):
+                    x, y = pt[0], pt[1]
+                    all_rectangles.append([x, y, scaled_w, scaled_h])
+
+            # Apply Non-Maximum Suppression (NMS) on all combined rectangles
+            if all_rectangles:
+                rectangles = self.non_max_suppression(all_rectangles, overlapThresh=0.3)
             else:
                 rectangles = []
-
-            # Secondary validation
-            if rectangles:
-                img_edges = cv2.Canny(img_gray, 50, 150)
-                roi_edges_base = cv2.Canny(roi_gray, 50, 150)
-
-                validated = []
-                roi_area = float(roi_gray.shape[0] * roi_gray.shape[1] + 1e-6)
-                is_uniform = len(rectangles) > 10
-                
-                for (x, y, w, h) in rectangles:
-                    if not self.validate_detection(img_gray, roi_gray, x, y, w, h, roi_area, is_uniform):
-                        continue
-                    validated.append((x, y, w, h))
-                rectangles = validated
 
             # Display results
             vis_bgr = self.original_image.copy()
@@ -1445,19 +1414,19 @@ class SmartObjectCounter:
             self.display_image = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
             self.display_image_on_canvas()
             
-            avg_thr = (np.mean(used_thresholds) if used_thresholds else 0.7)
-            results_info = (f"Method used: Template Matching (Scaling Only)\n"
+            avg_thr = (np.mean(used_thresholds) if used_thresholds else 0.5)
+            results_info = (f"Method used: Template Matching\n"
                             f"Detection: {detection_method}\n"
                             f"Rotation: Disabled\n"
                             f"Scaling: Enabled (0.6x to 1.4x)\n"
                             f"Objects Found: {len(rectangles)}\n"
-                            f"Auto Threshold: {avg_thr:.2f}\n")
+                            f"Average Threshold: {avg_thr:.2f}\n")
             
             self.results_text.delete(1.0, tk.END)
             self.results_text.insert(tk.END, results_info)
             
         except Exception as e:
-            messagebox.showerror("Error", f"Error in scaling-only detection: {str(e)}")
+            messagebox.showerror("Error", f"No matches found with selected scaling settings.")
 
 
     def count_objects_combined_rotation_scaling(self, roi_bgr, detection_method):
@@ -1705,7 +1674,7 @@ class SmartObjectCounter:
             self.results_text.insert(tk.END, results_info)
             
         except Exception as e:
-            messagebox.showerror("Error", f"Error in combined rotation+scaling detection: {str(e)}")
+            messagebox.showerror("Error", f"No matches found with selected rotation and scaling settings.")
 
     def count_objects_basic(self, roi_bgr, detection_method):
         """Apply basic template matching without rotation or scaling"""
