@@ -5,6 +5,8 @@ import numpy as np
 from PIL import Image, ImageTk
 from sklearn.cluster import DBSCAN
 import os
+from dataclasses import dataclass
+from typing import Tuple
 
 class SmartObjectCounter:
     def __init__(self, root):
@@ -26,6 +28,9 @@ class SmartObjectCounter:
         self.detected_objects = []  # Store detected object bounding boxes
         self.object_highlighted = False  # Track if objects are highlighted
 
+        # App mode: template (existing) or color (segmentation)
+        self.app_mode = tk.StringVar(value="template")
+
         # YOLO model (lazy loaded)
         self.yolo_model = None
         self.yolo_names = None
@@ -36,6 +41,21 @@ class SmartObjectCounter:
         self.orb_ratio = 0.75
         self.postproc_mode = "none"
 
+        # ------------ Color Segmentation state ------------
+        self.use_hsv = True
+        self.kernel = 3
+        self.min_area = 100
+        self.ws_enabled = False
+        self.ws_sensitivity = 35
+        self.roi_photo = None
+        # tolerance storage
+        self.tol_hue = 15
+        self.tol_sat = 60
+        self.tol_val = 60
+        self.tol_b = 30
+        self.tol_g = 30
+        self.tol_r = 30
+
         self.setup_gui()
 
     # ----------------------- GUI -----------------------
@@ -43,7 +63,7 @@ class SmartObjectCounter:
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        left_panel = ttk.Frame(main_frame, width=320)
+        left_panel = ttk.Frame(main_frame, width=380)
         left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         left_panel.pack_propagate(False)
 
@@ -56,42 +76,129 @@ class SmartObjectCounter:
         ttk.Button(left_panel, text="Reset", command=self.reset).pack(fill=tk.X, pady=4)
         ttk.Button(left_panel, text="Save Result", command=self.save_result).pack(fill=tk.X, pady=4)
 
+        # Mode switch
+        mode_frame = ttk.LabelFrame(left_panel, text="Mode")
+        mode_frame.pack(fill=tk.X, pady=10)
+        ttk.Radiobutton(mode_frame, text="Template Matching", variable=self.app_mode, value="template", command=self._on_mode_switch).pack(anchor=tk.W, padx=10, pady=2)
+        ttk.Radiobutton(mode_frame, text="Color Segmentation", variable=self.app_mode, value="color", command=self._on_mode_switch).pack(anchor=tk.W, padx=10, pady=2)
+
         # ROI Selection Section
-        roi_frame = ttk.LabelFrame(left_panel, text="ROI Selection")
-        roi_frame.pack(fill=tk.X, pady=10)
+        self.roi_frame = ttk.LabelFrame(left_panel, text="ROI Selection")
+        self.roi_frame.pack(fill=tk.X, pady=10)
         
         self.roi_method = tk.StringVar(value="auto")
-        ttk.Radiobutton(roi_frame, text="Auto Detection", variable=self.roi_method, 
+        ttk.Radiobutton(self.roi_frame, text="Auto Detection", variable=self.roi_method, 
                        value="auto", command=self.on_roi_method_change).pack(anchor=tk.W, padx=10, pady=2)
-        ttk.Radiobutton(roi_frame, text="Rectangle (drag)", variable=self.roi_method, 
+        ttk.Radiobutton(self.roi_frame, text="Rectangle (drag)", variable=self.roi_method, 
                        value="rectangle", command=self.on_roi_method_change).pack(anchor=tk.W, padx=10, pady=2)
         
-        ttk.Button(roi_frame, text="Clear", command=self.clear_roi).pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(self.roi_frame, text="Clear", command=self.clear_roi).pack(fill=tk.X, padx=10, pady=5)
 
         # Ready to detect status
         ttk.Label(left_panel, text="Ready to detect", font=("Arial", 10, "bold")).pack(pady=5)
 
         # Appearance Options Section
-        appearance_frame = ttk.LabelFrame(left_panel, text="Appearance Options")
-        appearance_frame.pack(fill=tk.X, pady=10)
+        self.appearance_frame = ttk.LabelFrame(left_panel, text="Appearance Options")
+        self.appearance_frame.pack(fill=tk.X, pady=10)
         
         self.detection_method = tk.StringVar(value="grayscale")
-        ttk.Radiobutton(appearance_frame, text="Detect by grayscale matching", 
+        ttk.Radiobutton(self.appearance_frame, text="Detect by grayscale matching", 
                        variable=self.detection_method, value="grayscale").pack(anchor=tk.W, padx=10, pady=2)
-        ttk.Radiobutton(appearance_frame, text="Detect by color matching", 
+        ttk.Radiobutton(self.appearance_frame, text="Detect by color matching", 
                        variable=self.detection_method, value="color").pack(anchor=tk.W, padx=10, pady=2)
 
         # Detection Flexibility Section
-        flexibility_frame = ttk.LabelFrame(left_panel, text="Detection Flexibility")
-        flexibility_frame.pack(fill=tk.X, pady=10)
+        self.flexibility_frame = ttk.LabelFrame(left_panel, text="Detection Flexibility")
+        self.flexibility_frame.pack(fill=tk.X, pady=10)
         
         self.detect_rotated = tk.BooleanVar(value=True)
         self.detect_scaled = tk.BooleanVar(value=True)
         
-        ttk.Checkbutton(flexibility_frame, text="Detect rotated objects", 
+        ttk.Checkbutton(self.flexibility_frame, text="Detect rotated objects", 
                        variable=self.detect_rotated).pack(anchor=tk.W, padx=10, pady=2)
-        ttk.Checkbutton(flexibility_frame, text="Detect objects of different sizes", 
+        ttk.Checkbutton(self.flexibility_frame, text="Detect objects of different sizes", 
                        variable=self.detect_scaled).pack(anchor=tk.W, padx=10, pady=2)
+
+        # ---------------- Color Segmentation Section (Scrollable) ----------------
+        self.color_frame = ttk.LabelFrame(left_panel, text="Color Segmentation Settings", padding=(8,8,8,8))
+        self.color_frame.pack(fill=tk.BOTH, pady=10, expand=False)
+
+        # Create a canvas + scrollbar inside color_frame
+        self.color_canvas = tk.Canvas(self.color_frame, borderwidth=0, highlightthickness=0)
+        self.color_scrollbar = ttk.Scrollbar(self.color_frame, orient="vertical", command=self.color_canvas.yview)
+        self.color_inner = ttk.Frame(self.color_canvas)
+
+        self.color_inner.bind("<Configure>", lambda e: self.color_canvas.configure(scrollregion=self.color_canvas.bbox("all")))
+        self.color_window = self.color_canvas.create_window((0, 0), window=self.color_inner, anchor="nw")
+        self.color_canvas.configure(yscrollcommand=self.color_scrollbar.set)
+
+        self.color_canvas.pack(side="left", fill="both", expand=True)
+        self.color_scrollbar.pack(side="right", fill="y")
+
+        # Bind mouse wheel to scroll when cursor is over the canvas
+        def _color_on_mousewheel(event):
+            try:
+                delta = int(-1 * (event.delta / 120))
+            except Exception:
+                delta = -1
+            self.color_canvas.yview_scroll(delta, "units")
+        self.color_canvas.bind_all("<MouseWheel>", _color_on_mousewheel)
+
+        # ROI Preview
+        roi_prev_frame = ttk.LabelFrame(self.color_inner, text="Selected ROI")
+        roi_prev_frame.pack(fill=tk.X, pady=6)
+        self.roi_preview_size = 200
+        self.roi_preview_label = tk.Label(roi_prev_frame, width=self.roi_preview_size, height=self.roi_preview_size, bg="#f0f0f0")
+        self.roi_preview_label.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        # Color space
+        cs_frame = ttk.LabelFrame(self.color_inner, text="Color Space")
+        cs_frame.pack(fill=tk.X, pady=6)
+        self.color_space_var = tk.IntVar(value=1)  # 1 HSV, 0 BGR
+        ttk.Radiobutton(cs_frame, text="HSV", variable=self.color_space_var, value=1, command=self._on_color_space_change).pack(anchor=tk.W)
+        ttk.Radiobutton(cs_frame, text="BGR", variable=self.color_space_var, value=0, command=self._on_color_space_change).pack(anchor=tk.W)
+
+        # Sliders
+        sliders = ttk.LabelFrame(self.color_inner, text="Detection Settings")
+        sliders.pack(fill=tk.X, pady=6)
+
+        self.hue_label = ttk.Label(sliders, text="Hue tol")
+        self.hue_label.pack(anchor=tk.W, padx=6)
+        self.hue_slider = tk.Scale(sliders, from_=0, to=90, orient=tk.HORIZONTAL, length=320, command=lambda v: self._on_color_slider_change())
+        self.hue_slider.set(self.tol_hue)
+        self.hue_slider.pack(fill=tk.X)
+
+        self.sat_label = ttk.Label(sliders, text="Sat tol")
+        self.sat_label.pack(anchor=tk.W, padx=6)
+        self.sat_slider = tk.Scale(sliders, from_=0, to=127, orient=tk.HORIZONTAL, length=320, command=lambda v: self._on_color_slider_change())
+        self.sat_slider.set(self.tol_sat)
+        self.sat_slider.pack(fill=tk.X)
+
+        self.val_label = ttk.Label(sliders, text="Val tol")
+        self.val_label.pack(anchor=tk.W, padx=6)
+        self.val_slider = tk.Scale(sliders, from_=0, to=127, orient=tk.HORIZONTAL, length=320, command=lambda v: self._on_color_slider_change())
+        self.val_slider.set(self.tol_val)
+        self.val_slider.pack(fill=tk.X)
+
+        ttk.Label(sliders, text="Morph kernel").pack(anchor=tk.W, padx=6)
+        self.kernel_slider = tk.Scale(sliders, from_=0, to=25, orient=tk.HORIZONTAL, length=320, command=lambda v: self._on_color_slider_change())
+        self.kernel_slider.set(self.kernel)
+        self.kernel_slider.pack(fill=tk.X)
+
+        ttk.Label(sliders, text="Min area").pack(anchor=tk.W, padx=6)
+        self.min_slider = tk.Scale(sliders, from_=1, to=20000, orient=tk.HORIZONTAL, length=320, command=lambda v: self._on_color_slider_change())
+        self.min_slider.set(self.min_area)
+        self.min_slider.pack(fill=tk.X)
+
+        # Watershed
+        ws_frame = ttk.LabelFrame(self.color_inner, text="Segmentation Refinement")
+        ws_frame.pack(fill=tk.X, pady=6)
+        self.ws_var = tk.IntVar(value=0)
+        ttk.Checkbutton(ws_frame, text="Split touching objects (watershed)", variable=self.ws_var, command=self._on_ws_toggle).pack(anchor=tk.W)
+        ttk.Label(ws_frame, text="Sensitivity").pack(anchor=tk.W, padx=6)
+        self.ws_slider = tk.Scale(ws_frame, from_=1, to=80, orient=tk.HORIZONTAL, length=320, command=lambda v: self._on_ws_slider_change())
+        self.ws_slider.set(self.ws_sensitivity)
+        self.ws_slider.pack(fill=tk.X)
 
 
 
@@ -121,6 +228,11 @@ class SmartObjectCounter:
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
 
         self.clear_results()
+
+        # Initialize visibility per mode
+        self._apply_mode_visibility()
+        # Ensure default color slider visibility and values
+        self._on_color_space_change()
 
     # ----------------------- Helpers -----------------------
     def _ensure_yolo(self):
@@ -494,8 +606,9 @@ class SmartObjectCounter:
         self.display_image_on_canvas()
         self.clear_results()
         
-        # Auto-detect objects with YOLO
-        self.auto_detect_objects()
+        # Auto-detect objects with YOLO if in template mode
+        if self.app_mode.get() == "template":
+            self.auto_detect_objects()
 
     def display_image_on_canvas(self):
         if self.display_image is None:
@@ -523,8 +636,8 @@ class SmartObjectCounter:
         if self.image is None:
             return
         
-        # If auto-detection is enabled and objects are highlighted, try to select one
-        if self.roi_method.get() == "auto" and self.object_highlighted and self.detected_objects:
+        # In template mode, allow auto YOLO selection
+        if self.app_mode.get() == "template" and self.roi_method.get() == "auto" and self.object_highlighted and self.detected_objects:
             canvas_x = (event.x - self.canvas_offset_x) / self.scale_factor
             canvas_y = (event.y - self.canvas_offset_y) / self.scale_factor
             
@@ -565,6 +678,10 @@ class SmartObjectCounter:
             if x2 > x1 and y2 > y1:
                 self.selected_roi = (x1, y1, x2, y2)
                 messagebox.showinfo("Info", f"ROI selected: {self.selected_roi}")
+                # Update ROI preview for color mode
+                if self.app_mode.get() == "color":
+                    self._update_roi_preview()
+                    self._update_color_preview()
 
     def clear_roi(self):
         """Clear the current ROI selection"""
@@ -579,11 +696,15 @@ class SmartObjectCounter:
 
     def on_roi_method_change(self):
         """Handle ROI method change between auto detection and rectangle selection"""
+        # Force rectangle mode for color segmentation
+        if self.app_mode.get() == "color":
+            self.roi_method.set("rectangle")
         if self.roi_method.get() == "auto":
             # Switch to auto detection - run YOLO detection
             if self.original_image is not None:
                 self.clear_roi()
-                self.auto_detect_objects()
+                if self.app_mode.get() == "template":
+                    self.auto_detect_objects()
         else:
             # Switch to rectangle selection - clear YOLO detections
             self.detected_objects = []
@@ -597,6 +718,8 @@ class SmartObjectCounter:
     def auto_detect_objects(self):
         """Automatically detect objects using YOLO or classical methods"""
         try:
+            if self.app_mode.get() != "template":
+                return
             # Try YOLO first
             if self._ensure_yolo():
                 print("Running YOLO detection...")
@@ -716,6 +839,11 @@ class SmartObjectCounter:
         if self.original_image is None:
             messagebox.showwarning("Warning", "Please load an image first")
             return
+        # Route to active mode
+        if self.app_mode.get() == "color":
+            self._count_objects_color()
+            return
+        # template flow from here
         if self.selected_roi is None:
             messagebox.showwarning("Warning", "Please select a reference ROI")
             return
@@ -1911,10 +2039,292 @@ class SmartObjectCounter:
         self.object_highlighted = False
         self.canvas.delete("all")
         self.clear_results()
+        # Reset color controls
+        if hasattr(self, 'color_space_var'):
+            self.color_space_var.set(1)
+        if hasattr(self, 'hue_slider'):
+            self.hue_slider.set(15)
+        if hasattr(self, 'sat_slider'):
+            self.sat_slider.set(60)
+        if hasattr(self, 'val_slider'):
+            self.val_slider.set(60)
+        if hasattr(self, 'kernel_slider'):
+            self.kernel_slider.set(3)
+        if hasattr(self, 'min_slider'):
+            self.min_slider.set(100)
+        if hasattr(self, 'ws_var'):
+            self.ws_var.set(0)
+        if hasattr(self, 'ws_slider'):
+            self.ws_slider.set(35)
 
     def clear_results(self):
         self.results_text.delete(1.0, tk.END)
         self.results_text.insert(tk.END, "No results yet. Load image and select ROI.\n")
+
+    # ===================== Color Segmentation Utilities =====================
+    def _on_mode_switch(self):
+        self._apply_mode_visibility()
+        # In color mode, force rectangle ROI and disable YOLO auto
+        if self.app_mode.get() == "color":
+            self.roi_method.set("rectangle")
+            self.detected_objects = []
+            self.object_highlighted = False
+            self.display_image = cv2.cvtColor(self.original_image.copy(), cv2.COLOR_BGR2RGB) if self.original_image is not None else None
+            self.display_image_on_canvas()
+        else:
+            # template mode
+            if self.original_image is not None and self.roi_method.get() == "auto":
+                self.auto_detect_objects()
+
+    def _apply_mode_visibility(self):
+        is_color = self.app_mode.get() == "color"
+        # Color section visibility
+        try:
+            self.color_frame.pack_forget()
+        except Exception:
+            pass
+        if is_color:
+            self.color_frame.pack(fill=tk.BOTH, pady=10, expand=True)
+        # Template-only sections visibility (ROI is always visible)
+        for frame in [self.appearance_frame, self.flexibility_frame]:
+            try:
+                frame.pack_forget()
+            except Exception:
+                pass
+        if not is_color:
+            self.appearance_frame.pack(fill=tk.X, pady=10)
+            self.flexibility_frame.pack(fill=tk.X, pady=10)
+
+    def _on_color_space_change(self):
+        self.use_hsv = (self.color_space_var.get() == 1)
+        if self.use_hsv:
+            self.hue_label.config(text="Hue tol")
+            self.sat_label.config(text="Sat tol")
+            self.val_label.config(text="Val tol")
+            self.hue_slider.config(from_=0, to=90)
+            self.sat_slider.config(from_=0, to=127)
+            self.val_slider.config(from_=0, to=127)
+            self.hue_slider.set(self.tol_hue)
+            self.sat_slider.set(self.tol_sat)
+            self.val_slider.set(self.tol_val)
+        else:
+            self.hue_label.config(text="Blue tol")
+            self.sat_label.config(text="Green tol")
+            self.val_label.config(text="Red tol")
+            self.hue_slider.config(from_=0, to=255)
+            self.sat_slider.config(from_=0, to=255)
+            self.val_slider.config(from_=0, to=255)
+            self.hue_slider.set(self.tol_b)
+            self.sat_slider.set(self.tol_g)
+            self.val_slider.set(self.tol_r)
+        self._update_color_preview()
+
+    def _on_color_slider_change(self):
+        # sync tolerances
+        if self.use_hsv:
+            self.tol_hue = int(self.hue_slider.get())
+            self.tol_sat = int(self.sat_slider.get())
+            self.tol_val = int(self.val_slider.get())
+        else:
+            self.tol_b = int(self.hue_slider.get())
+            self.tol_g = int(self.sat_slider.get())
+            self.tol_r = int(self.val_slider.get())
+        self.kernel = int(self.kernel_slider.get())
+        self.min_area = int(self.min_slider.get())
+        self._update_color_preview()
+
+    def _on_ws_toggle(self):
+        self.ws_enabled = (self.ws_var.get() == 1)
+        self._update_color_preview()
+
+    def _on_ws_slider_change(self):
+        self.ws_sensitivity = int(self.ws_slider.get())
+        self._update_color_preview()
+
+    def _update_roi_preview(self):
+        if self.selected_roi is None or self.original_image is None:
+            return
+        x1, y1, x2, y2 = self.selected_roi
+        if x2 <= x1 or y2 <= y1:
+            return
+        roi_bgr = self.original_image[y1:y2, x1:x2]
+        if roi_bgr.size == 0:
+            return
+        roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+        h, w = roi_rgb.shape[:2]
+        size = self.roi_preview_size
+        scale = min(size / max(1, w), size / max(1, h))
+        new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+        roi_resized = cv2.resize(roi_rgb, (new_w, new_h))
+        canvas = np.full((size, size, 3), 240, dtype=np.uint8)
+        y_off = (size - new_h) // 2
+        x_off = (size - new_w) // 2
+        canvas[y_off:y_off+new_h, x_off:x_off+new_w] = roi_resized
+        pil = Image.fromarray(canvas)
+        self.roi_photo = ImageTk.PhotoImage(pil)
+        self.roi_preview_label.config(image=self.roi_photo, text="")
+
+    # ---- color math helpers ----
+    def _clamp_bgr_range(self, center: Tuple[int, int, int]) -> Tuple[np.ndarray, np.ndarray]:
+        b, g, r = center
+        lower = np.array([max(0, b - self.tol_b), max(0, g - self.tol_g), max(0, r - self.tol_r)], dtype=np.uint8)
+        upper = np.array([min(255, b + self.tol_b), min(255, g + self.tol_g), min(255, r + self.tol_r)], dtype=np.uint8)
+        return lower, upper
+
+    def _most_frequent_color(self, roi: np.ndarray, color_space: str = 'bgr') -> Tuple[int, int, int]:
+        if roi is None or roi.size == 0:
+            return (0, 0, 0)
+        if color_space == 'hsv':
+            roi_converted = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        else:
+            roi_converted = roi.copy()
+        pixels = roi_converted.reshape(-1, 3)
+        if len(pixels) > 10000:
+            step = len(pixels) // 5000
+            pixels = pixels[::step]
+        if color_space == 'hsv':
+            mask = (pixels[:, 1] > 30) & (pixels[:, 2] < 240)
+            filtered = pixels[mask]
+        else:
+            brightness = np.mean(pixels, axis=1)
+            mask = brightness < 200
+            filtered = pixels[mask]
+        if len(filtered) < len(pixels) * 0.1:
+            filtered = pixels
+        unique_colors, counts = np.unique(filtered, axis=0, return_counts=True)
+        idx = int(np.argmax(counts)) if len(counts) > 0 else 0
+        color = unique_colors[idx] if len(unique_colors) > 0 else [0, 0, 0]
+        return int(color[0]), int(color[1]), int(color[2])
+
+    def _compute_mask(self, img_bgr: np.ndarray, roi_mean_bgr: Tuple[int, int, int], roi_mean_hsv: Tuple[int, int, int]) -> np.ndarray:
+        if self.use_hsv:
+            hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+            h, s, v = roi_mean_hsv
+            h_low = h - self.tol_hue
+            h_high = h + self.tol_hue
+            s_low = max(0, s - self.tol_sat)
+            s_high = min(255, s + self.tol_sat)
+            v_low = max(0, v - self.tol_val)
+            v_high = min(255, v + self.tol_val)
+            if h_low < 0 or h_high > 179:
+                h_low_1 = (h_low + 180) if h_low < 0 else h_low
+                h_high_1 = 179
+                h_low_2 = 0
+                h_high_2 = (h_high - 180) if h_high > 179 else h_high
+                low1 = np.array([h_low_1, s_low, v_low], dtype=np.uint8)
+                high1 = np.array([h_high_1, s_high, v_high], dtype=np.uint8)
+                low2 = np.array([h_low_2, s_low, v_low], dtype=np.uint8)
+                high2 = np.array([h_high_2, s_high, v_high], dtype=np.uint8)
+                mask = cv2.inRange(hsv, low1, high1) | cv2.inRange(hsv, low2, high2)
+            else:
+                low = np.array([max(0, h_low), s_low, v_low], dtype=np.uint8)
+                high = np.array([min(179, h_high), s_high, v_high], dtype=np.uint8)
+                mask = cv2.inRange(hsv, low, high)
+        else:
+            low, high = self._clamp_bgr_range(roi_mean_bgr)
+            mask = cv2.inRange(img_bgr, low, high)
+
+        if self.kernel > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.kernel, self.kernel))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        return mask
+
+    def _apply_watershed(self, mask: np.ndarray, img_bgr: np.ndarray) -> np.ndarray:
+        if not self.ws_enabled or mask is None or img_bgr is None:
+            return mask
+        bin_mask = (mask > 0).astype(np.uint8) * 255
+        ksize = max(3, self.kernel | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        sure_bg = cv2.dilate(bin_mask, kernel, iterations=1)
+        dist = cv2.distanceTransform(bin_mask, cv2.DIST_L2, 5)
+        dist_norm = dist / (dist.max() + 1e-6) if dist.max() > 0 else dist
+        thr = 0.2 + (min(max(self.ws_sensitivity, 1), 80) / 80.0) * (0.7 - 0.2)
+        sure_fg = (dist_norm > thr).astype(np.uint8) * 255
+        unknown = cv2.subtract(sure_bg, sure_fg)
+        num_markers, markers = cv2.connectedComponents((sure_fg > 0).astype(np.uint8))
+        markers = markers + 1
+        markers[unknown > 0] = 0
+        ws_markers = cv2.watershed(img_bgr.copy(), markers)
+        refined = np.zeros_like(bin_mask)
+        refined[ws_markers > 1] = 255
+        return refined
+
+    def _update_color_preview(self):
+        if self.original_image is None or self.selected_roi is None:
+            return
+        x1, y1, x2, y2 = self.selected_roi
+        roi = self.original_image[y1:y2, x1:x2]
+        roi_mean_bgr = self._most_frequent_color(roi, 'bgr')
+        roi_mean_hsv = self._most_frequent_color(roi, 'hsv')
+        mask = self._compute_mask(self.original_image, roi_mean_bgr, roi_mean_hsv)
+        if self.ws_enabled:
+            mask = self._apply_watershed(mask, self.original_image)
+        vis, _ = self._count_and_draw(mask, cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB), max(1, self.min_area))
+        self.display_image = vis
+        self.display_image_on_canvas()
+        self._display_color_results(mask, (x2 - x1) * (y2 - y1))
+
+    def _count_and_draw(self, mask: np.ndarray, img_rgb: np.ndarray, min_area: int):
+        num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        vis = img_rgb.copy()
+        count = 0
+        for i in range(1, num):
+            x, y, w, h, area = stats[i]
+            if area < min_area:
+                continue
+            count += 1
+            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cx, cy = centroids[i]
+            cv2.circle(vis, (int(cx), int(cy)), 3, (0, 0, 255), -1)
+        return vis, count
+
+    def _display_color_results(self, mask, ref_area):
+        num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        objects = []
+        for i in range(1, num):
+            x, y, w, h, area = stats[i]
+            if area >= self.min_area:
+                objects.append((x, y, w, h, area))
+        ws_info = f"  WS:{'on' if self.ws_enabled else 'off'}"
+        if self.ws_enabled:
+            ws_info += f"({int(self.ws_slider.get())})"
+        if self.use_hsv:
+            mode_info = f"H:{self.tol_hue}  S:{self.tol_sat}  V:{self.tol_val}"
+        else:
+            mode_info = f"B:{self.tol_b}  G:{self.tol_g}  R:{self.tol_r}"
+        text = (f"Reference Area: {ref_area:.1f} px²\n"
+                f"Objects Detected : {len(objects)}\n\n"
+                f"Mode: {'HSV' if self.use_hsv else 'BGR'}{ws_info}\n"
+                f"{mode_info}\n"
+                f"Kernel:{self.kernel}  MinArea:{self.min_area}")
+        self.results_text.delete(1.0, tk.END)
+        self.results_text.insert(tk.END, text)
+
+    def _count_objects_color(self):
+        if self.selected_roi is None:
+            messagebox.showwarning("Warning", "Please select a reference ROI (rectangle)")
+            return
+        x1, y1, x2, y2 = self.selected_roi
+        if (x2 - x1) < 5 or (y2 - y1) < 5:
+            self.results_text.delete(1.0, tk.END)
+            self.results_text.insert(tk.END, "No objects found in the image.\n")
+            return
+        self.use_hsv = (self.color_space_var.get() == 1)
+        # sync tolerances
+        self._on_color_slider_change()
+        roi = self.original_image[y1:y2, x1:x2]
+        roi_mean_bgr = self._most_frequent_color(roi, 'bgr')
+        roi_mean_hsv = self._most_frequent_color(roi, 'hsv')
+        mask = self._compute_mask(self.original_image, roi_mean_bgr, roi_mean_hsv)
+        if self.ws_enabled:
+            mask = self._apply_watershed(mask, self.original_image)
+        vis, _ = self._count_and_draw(mask, cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB), self.min_area)
+        # update results text
+        self._display_color_results(mask, (x2 - x1) * (y2 - y1))
+        # show annotated
+        self.display_image = vis
+        self.display_image_on_canvas()
 
 
 def main():
