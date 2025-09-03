@@ -11,7 +11,7 @@ from typing import Tuple
 class SmartObjectCounter:
     def __init__(self, root):
         self.root = root
-        self.root.title("Smart Object Counter with Rotation and Scaling")
+        self.root.title("Smart Object Counter")
         self.root.geometry("1200x800")
 
         # images/state
@@ -243,8 +243,6 @@ class SmartObjectCounter:
         self.ws_slider = tk.Scale(ws_frame, from_=1, to=80, orient=tk.HORIZONTAL, length=320, command=lambda v: self._on_ws_slider_change())
         self.ws_slider.set(self.ws_sensitivity)
         self.ws_slider.pack(fill=tk.X)
-
-
 
         # Instructions
         instruction_frame = ttk.LabelFrame(left_panel, text="Instructions")
@@ -1054,7 +1052,7 @@ class SmartObjectCounter:
             messagebox.showerror("Error", f"Error counting objects with YOLO: {str(e)}")
 
     def count_objects_rotation_only(self, roi_bgr, detection_method):
-        """Apply only rotation detection logic (from apply_rotation.py)"""
+        """Apply only rotation detection logic"""
         try:
             # Check if ROI is too small (blank selection)
             if roi_bgr.shape[0] < 5 or roi_bgr.shape[1] < 5:
@@ -1542,7 +1540,7 @@ class SmartObjectCounter:
                     self.results_text.insert(tk.END, results_info)
                     return
 
-            # Template Matching with BOTH rotation AND scaling
+            # Template Matching with both rotation and scaling
             elif method_used == "Template Matching":
                 rectangles = []
                 used_thresholds = []
@@ -1574,7 +1572,7 @@ class SmartObjectCounter:
                     scaled_roi_gray = cv2.resize(rotated_gray, (scaled_w, scaled_h))
                     res = cv2.matchTemplate(img_gray, scaled_roi_gray, cv2.TM_CCOEFF_NORMED)
                     
-                    # Check if we're likely dealing with uniform objects
+                    # Check if dealing with uniform objects
                     res_mean = np.mean(res)
                     res_std = np.std(res)
                     is_uniform = res_mean > 0.15 and res_std < 0.2
@@ -2125,7 +2123,6 @@ class SmartObjectCounter:
         # show annotated
         self.display_image = vis
         self.display_image_on_canvas()
-
 
 def main():
     root = tk.Tk()
