@@ -1,0 +1,18 @@
+# Core image processing and computer vision
+opencv-python>=4.8.0
+numpy>=1.21.0
+Pillow>=9.0.0
+
+# Machine learning and clustering
+scikit-learn>=1.0.0
+
+# YOLO object detection
+ultralytics>=8.0.0
+
+# Additional useful packages for image processing
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Optional: For better performance (if available)
+# torch>=1.12.0
+# torchvision>=0.13.0
