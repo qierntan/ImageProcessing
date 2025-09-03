@@ -144,11 +144,14 @@ class SmartObjectCounter:
         
         self.detect_rotated = tk.BooleanVar(value=True)
         self.detect_scaled = tk.BooleanVar(value=True)
+        self.detect_scaled_safe = tk.BooleanVar(value=False)
         
         ttk.Checkbutton(self.flexibility_frame, text="Detect rotated objects", 
                        variable=self.detect_rotated).pack(anchor=tk.W, padx=10, pady=2)
         ttk.Checkbutton(self.flexibility_frame, text="Detect objects of different sizes", 
                        variable=self.detect_scaled).pack(anchor=tk.W, padx=10, pady=2)
+        ttk.Checkbutton(self.flexibility_frame, text="Detect objects of different sizes (safe)", 
+                       variable=self.detect_scaled_safe).pack(anchor=tk.W, padx=10, pady=2)
 
         # Ensure order: ROI -> Appearance -> Flexibility
         try:
@@ -370,13 +373,13 @@ class SmartObjectCounter:
         if x < 0 or y < 0 or x + w > img_gray.shape[1] or y + h > img_gray.shape[0]:
             return False
         
-        # Area ratio validation - more lenient for uniform objects
+        # Area ratio validation - more lenient for uniform objects and expanded range for all objects
         area_ratio = (w * h) / roi_area
         if is_uniform:
-            if area_ratio < 0.25 or area_ratio > 4.5:  # More flexible for uniform objects
+            if area_ratio < 0.15 or area_ratio > 7.0:  # Much more flexible for uniform objects
                 return False
         else:
-            if area_ratio < 0.3 or area_ratio > 4.0:
+            if area_ratio < 0.2 or area_ratio > 6.0:  # Expanded range for all objects
                 return False
         
         # Edge-based validation
@@ -646,6 +649,10 @@ class SmartObjectCounter:
         self.detection_method.set("grayscale")
         self.detect_rotated.set(True)
         self.detect_scaled.set(True)
+        try:
+            self.detect_scaled_safe.set(False)
+        except Exception:
+            pass
         
         # Clear previous state
         self.selected_roi = None
@@ -916,19 +923,13 @@ class SmartObjectCounter:
         # Check which detection methods are enabled
         detect_rotated = self.detect_rotated.get()
         detect_scaled = self.detect_scaled.get()
+        detect_scaled_safe = self.detect_scaled_safe.get()
         
         # Apply different logic based on checkbox selections
-        if detect_rotated and detect_scaled:
-            # Both enabled: use combined rotation + scaling logic
+        if detect_rotated or detect_scaled or detect_scaled_safe:
+            # If any detection flexibility is enabled, use the combined method
+            # This ensures that rotation and scaling detection work independently
             self.count_objects_combined_rotation_scaling(roi_bgr, detection_method)
-            return
-        elif detect_rotated:
-            # Only rotation enabled: use apply_rotation.py logic
-            self.count_objects_rotation_only(roi_bgr, detection_method)
-            return
-        elif detect_scaled:
-            # Only scaling enabled: use applyscaling.py logic
-            self.count_objects_scaling_only(roi_bgr, detection_method)
             return
         else:
             # Neither enabled: use basic template matching
@@ -1139,11 +1140,11 @@ class SmartObjectCounter:
                         x, y, w, h = cv2.boundingRect(np.int32(dst))
                         roi_area = float(w_roi * h_roi + 1e-6)
                         scale_sq = (w * h) / roi_area
-                        if scale_sq < 0.30 or scale_sq > 3.8:
+                        if scale_sq < 0.15 or scale_sq > 7.0:  # Expanded range for better size detection
                             continue
                         aspect_roi = w_roi / (h_roi + 1e-6)
                         aspect_box = w / (h + 1e-6)
-                        if abs(aspect_box - aspect_roi) / aspect_roi > 0.65:
+                        if abs(aspect_box - aspect_roi) / aspect_roi > 0.85:  # More lenient aspect ratio check
                             continue
                         boxes_local.append([x, y, w, h])
                         objects_local += 1
@@ -1701,9 +1702,111 @@ class SmartObjectCounter:
         except Exception as e:
             messagebox.showerror("Error", f"Error in scaling-only detection: {str(e)}")
 
+    def count_objects_scaling_safe(self, roi_bgr, detection_method):
+        """New safe multi-scale template detection with size guards and pyramid search.
+        Does not modify existing scaling-only behavior."""
+        try:
+            # Convert original image and ROI based on detection method
+            if detection_method == "grayscale":
+                img_gray = self.preprocess_gray(self.original_image)
+                roi_gray = self.preprocess_gray(roi_bgr)
+            else:
+                img_hsv = self.preprocess_color(self.original_image)
+                roi_hsv = self.preprocess_color(roi_bgr)
+                img_gray = cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR)
+                roi_bgr_tmp = cv2.cvtColor(roi_hsv, cv2.COLOR_HSV2BGR)
+                roi_gray = cv2.cvtColor(roi_bgr_tmp, cv2.COLOR_BGR2GRAY)
+
+            # Sanity check: ROI smaller than image
+            ih, iw = img_gray.shape[:2]
+            rh, rw = roi_gray.shape[:2]
+            if rh < 8 or rw < 8 or rh > ih or rw > iw:
+                messagebox.showwarning("Warning", "ROI size invalid for safe scaling; please reselect a smaller ROI.")
+                return
+
+            # Build image pyramid for robust matching without invalid sizes
+            pyramid_scales = [1.0, 0.9, 0.8, 0.7, 0.6, 1.1, 1.2, 1.3, 1.4]
+            rectangles = []
+            used_thresholds = []
+
+            for scale in pyramid_scales:
+                # Compute scaled ROI; skip if it exceeds image bounds
+                sw = max(8, int(round(rw * scale)))
+                sh = max(8, int(round(rh * scale)))
+                if sw > iw or sh > ih:
+                    continue
+                scaled_roi = cv2.resize(roi_gray, (sw, sh), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC)
+
+                # Another guard: ensure template smaller or equal to image
+                if sh > ih or sw > iw:
+                    continue
+
+                res = cv2.matchTemplate(img_gray, scaled_roi, cv2.TM_CCOEFF_NORMED)
+
+                # Adaptive threshold
+                auto_thr = self.compute_auto_template_threshold(res)
+                used_thresholds.append(auto_thr)
+
+                # Local maxima detection with kernel size relative to template
+                kh = max(2, int(round(sh * 0.06)))
+                kw = max(2, int(round(sw * 0.06)))
+                kernel = np.ones((kh, kw), np.uint8)
+                res_dil = cv2.dilate(res, kernel)
+                maxima = (res >= auto_thr) & (res == res_dil)
+                ys, xs = np.where(maxima)
+                for y, x in zip(ys, xs):
+                    rectangles.append([x, y, sw, sh])
+
+            # Post-processing
+            if rectangles:
+                rectangles, _ = cv2.groupRectangles(rectangles, groupThreshold=1, eps=0.5)
+                rectangles = self.non_max_suppression(rectangles, overlapThresh=0.35)
+            else:
+                rectangles = []
+
+            # Validate by edges/area
+            validated = []
+            roi_area = float(rh * rw + 1e-6)
+            for (x, y, w, h) in rectangles:
+                if not self.validate_detection(img_gray, roi_gray, x, y, w, h, roi_area, is_uniform=False):
+                    continue
+                validated.append((x, y, w, h))
+            rectangles = validated
+
+            # Draw
+            vis_bgr = self.original_image.copy()
+            for (x, y, w, h) in rectangles:
+                cv2.rectangle(vis_bgr, (x, y), (x + w, y + h), (150, 220, 255), 2)
+
+            self.display_image = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
+            self.display_image_on_canvas()
+
+            avg_thr = (np.mean(used_thresholds) if used_thresholds else 0.7)
+            results_info = ("Method used: Template Matching (Scaling Safe)\n"
+                            f"Detection: {detection_method}\n"
+                            "Rotation: Disabled\n"
+                            "Scaling: Enabled (safe pyramid)\n"
+                            f"Objects Found: {len(rectangles)}\n"
+                            f"Auto Threshold: {avg_thr:.2f}\n")
+
+            self.results_text.delete(1.0, tk.END)
+            self.results_text.insert(tk.END, results_info)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Error in scaling-safe detection: {str(e)}")
+
     def count_objects_combined_rotation_scaling(self, roi_bgr, detection_method):
         """Apply both rotation and scaling detection logic (from apply_rotation.py)"""
         try:
+            # Check if ROI is too small (blank selection)
+            if roi_bgr.shape[0] < 5 or roi_bgr.shape[1] < 5:
+                self.results_text.delete(1.0, tk.END)
+                self.results_text.insert(tk.END, "No objects found in the image.")
+                # Update display to show original image without highlighting
+                self.display_image = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB)
+                self.display_image_on_canvas()
+                return
+                
             # Convert original image and ROI based on detection method
             if detection_method == "grayscale":
                 img_gray = self.preprocess_gray(self.original_image)
@@ -1772,11 +1875,11 @@ class SmartObjectCounter:
                             # sanity checks for scale/aspect
                             roi_area = float(max(1, w_roi * h_roi))
                             scale_sq = (w * h) / roi_area
-                            if scale_sq < 0.30 or scale_sq > 3.8:
+                            if scale_sq < 0.15 or scale_sq > 7.0:  # Expanded range for better size detection
                                 continue
                             aspect_roi = w_roi / (h_roi + 1e-6)
                             aspect_box = w / (h + 1e-6)
-                            if abs(aspect_box - aspect_roi) / max(1e-6, aspect_roi) > 0.65:
+                            if abs(aspect_box - aspect_roi) / max(1e-6, aspect_roi) > 0.85:  # More lenient aspect ratio check
                                 continue
                             rects.append((x, y, w, h))
                     return rects, len(good_local)
@@ -1811,9 +1914,16 @@ class SmartObjectCounter:
             rectangles = []
             used_thresholds = []
             
-            # Both rotation and scaling detection enabled
-            angles = range(0, 360, 8)
-            scales = [0.60, 0.70, 0.80, 0.90, 1.0, 1.1, 1.2, 1.3, 1.4]
+            # Configure rotation and scaling based on user settings
+            if self.detect_rotated.get():
+                angles = range(0, 360, 8)
+            else:
+                angles = [0]  # No rotation detection
+                
+            if self.detect_scaled.get() or self.detect_scaled_safe.get():
+                scales = [0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.7, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
+            else:
+                scales = [1.0]  # No scaling detection
             
             for angle in angles:
                 if angle != 0:
@@ -1937,6 +2047,15 @@ class SmartObjectCounter:
     def count_objects_basic(self, roi_bgr, detection_method):
         """Apply basic template matching without rotation or scaling"""
         try:
+            # Check if ROI is too small (blank selection)
+            if roi_bgr.shape[0] < 5 or roi_bgr.shape[1] < 5:
+                self.results_text.delete(1.0, tk.END)
+                self.results_text.insert(tk.END, "No objects found in the image.")
+                # Update display to show original image without highlighting
+                self.display_image = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB)
+                self.display_image_on_canvas()
+                return
+                
             # Convert original image and ROI based on detection method
             if detection_method == "grayscale":
                 img_gray = self.preprocess_gray(self.original_image)
@@ -1953,9 +2072,9 @@ class SmartObjectCounter:
             rectangles = []
             used_thresholds = []
             
-            # No rotation or scaling
+            # No rotation, but improved scaling range
             angles = [0]
-            scales = [1.0]
+            scales = [0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.7, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
             
             for angle in angles:
                 rotated_gray = roi_gray  # No rotation
@@ -2365,6 +2484,9 @@ class SmartObjectCounter:
         if (x2 - x1) < 5 or (y2 - y1) < 5:
             self.results_text.delete(1.0, tk.END)
             self.results_text.insert(tk.END, "No objects found in the image.\n")
+            # Update display to show original image without highlighting
+            self.display_image = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB)
+            self.display_image_on_canvas()
             return
         self.use_hsv = (self.color_space_var.get() == 1)
         # sync tolerances
