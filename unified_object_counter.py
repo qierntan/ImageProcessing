@@ -186,15 +186,28 @@ class UnifiedObjectCounter:
         self.template_frame = ttk.LabelFrame(left_panel, text="Appearance Options")
         self.template_frame.pack(fill=tk.X, pady=10)
         
+        # Create scrollable frame for template options
+        template_canvas = tk.Canvas(self.template_frame, height=200)
+        template_scrollbar = ttk.Scrollbar(self.template_frame, orient="vertical", command=template_canvas.yview)
+        self.template_scrollable_frame = ttk.Frame(template_canvas)
+        
+        self.template_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: template_canvas.configure(scrollregion=template_canvas.bbox("all"))
+        )
+        
+        template_canvas.create_window((0, 0), window=self.template_scrollable_frame, anchor="nw")
+        template_canvas.configure(yscrollcommand=template_scrollbar.set)
+        
         # Appearance method selection
         self.appearance_var = tk.StringVar(value="grayscale")
-        ttk.Radiobutton(self.template_frame, text="Detect by grayscale matching", 
+        ttk.Radiobutton(self.template_scrollable_frame, text="Detect by grayscale matching", 
                        variable=self.appearance_var, value="grayscale").pack(anchor=tk.W)
-        ttk.Radiobutton(self.template_frame, text="Detect by color matching", 
+        ttk.Radiobutton(self.template_scrollable_frame, text="Detect by color matching", 
                        variable=self.appearance_var, value="color").pack(anchor=tk.W)
 
         # Detection flexibility options
-        flexibility_frame = ttk.LabelFrame(self.template_frame, text="Detection Flexibility")
+        flexibility_frame = ttk.LabelFrame(self.template_scrollable_frame, text="Detection Flexibility")
         flexibility_frame.pack(fill=tk.X, pady=10)
         
         self.rotated_var = tk.BooleanVar(value=False)
@@ -202,15 +215,37 @@ class UnifiedObjectCounter:
         
         ttk.Checkbutton(flexibility_frame, text="Detect rotated objects (slower)", 
                        variable=self.rotated_var).pack(anchor=tk.W)
-        ttk.Checkbutton(flexibility_frame, text="Detect objects of different sizes", 
+        ttk.Checkbutton(flexibility_frame, text="Detect different sizes using YOLO (recommended)", 
                        variable=self.sizes_var).pack(anchor=tk.W)
+        
+        # Pack the scrollable components
+        template_canvas.pack(side="left", fill="both", expand=True)
+        template_scrollbar.pack(side="right", fill="y")
+        
+        # Bind mouse wheel to template canvas
+        def _on_template_mousewheel(event):
+            template_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        template_canvas.bind_all("<MouseWheel>", _on_template_mousewheel)
 
-        # Color Segmentation Options
+                # Color Segmentation Options
         self.color_frame = ttk.LabelFrame(left_panel, text="Color Segmentation Options")
         self.color_frame.pack(fill=tk.X, pady=10)
         
+        # Create scrollable frame for color options
+        color_canvas = tk.Canvas(self.color_frame, height=300)
+        color_scrollbar = ttk.Scrollbar(self.color_frame, orient="vertical", command=color_canvas.yview)
+        self.color_scrollable_frame = ttk.Frame(color_canvas)
+        
+        self.color_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: color_canvas.configure(scrollregion=color_canvas.bbox("all"))
+        )
+        
+        color_canvas.create_window((0, 0), window=self.color_scrollable_frame, anchor="nw")
+        color_canvas.configure(yscrollcommand=color_scrollbar.set)
+        
         # Color space selection
-        color_mode_frame = ttk.Frame(self.color_frame)
+        color_mode_frame = ttk.Frame(self.color_scrollable_frame)
         color_mode_frame.pack(fill=tk.X, pady=5)
         self.color_mode_var = tk.IntVar(value=1)
         ttk.Radiobutton(color_mode_frame, text="HSV", variable=self.color_mode_var, 
@@ -218,51 +253,74 @@ class UnifiedObjectCounter:
         ttk.Radiobutton(color_mode_frame, text="BGR", variable=self.color_mode_var, 
                        value=0, command=self.on_color_mode_change).pack(side=tk.LEFT)
         
-        # Sliders
-        self.hue_label = ttk.Label(self.color_frame, text="Hue tol")
+        # Sliders with live preview
+        self.hue_label = ttk.Label(self.color_scrollable_frame, text="Hue tol")
         self.hue_label.pack(anchor=tk.W, padx=6)
-        self.hue_slider = tk.Scale(self.color_frame, from_=0, to=90, orient=tk.HORIZONTAL,
-                                   command=lambda v: self.on_slider_change())
+        self.hue_slider = tk.Scale(self.color_scrollable_frame, from_=0, to=90, orient=tk.HORIZONTAL,
+                                   command=lambda v: self.on_slider_change_live())
         self.hue_slider.set(self.tol.hue)
         self.hue_slider.pack(fill=tk.X)
 
-        self.sat_label = ttk.Label(self.color_frame, text="Sat tol")
+        self.sat_label = ttk.Label(self.color_scrollable_frame, text="Sat tol")
         self.sat_label.pack(anchor=tk.W, padx=6)
-        self.sat_slider = tk.Scale(self.color_frame, from_=0, to=127, orient=tk.HORIZONTAL,
-                                   command=lambda v: self.on_slider_change())
+        self.sat_slider = tk.Scale(self.color_scrollable_frame, from_=0, to=127, orient=tk.HORIZONTAL,
+                                   command=lambda v: self.on_slider_change_live())
         self.sat_slider.set(self.tol.sat)
         self.sat_slider.pack(fill=tk.X)
 
-        self.val_label = ttk.Label(self.color_frame, text="Val tol")
+        self.val_label = ttk.Label(self.color_scrollable_frame, text="Val tol")
         self.val_label.pack(anchor=tk.W, padx=6)
-        self.val_slider = tk.Scale(self.color_frame, from_=0, to=127, orient=tk.HORIZONTAL,
-                                   command=lambda v: self.on_slider_change())
+        self.val_slider = tk.Scale(self.color_scrollable_frame, from_=0, to=127, orient=tk.HORIZONTAL,
+                                   command=lambda v: self.on_slider_change_live())
         self.val_slider.set(self.tol.val)
         self.val_slider.pack(fill=tk.X)
 
-        ttk.Label(self.color_frame, text="Morph kernel").pack(anchor=tk.W, padx=6)
-        self.kernel_slider = tk.Scale(self.color_frame, from_=0, to=25, orient=tk.HORIZONTAL,
-                                      command=lambda v: self.on_slider_change())
+        ttk.Label(self.color_scrollable_frame, text="Morph kernel").pack(anchor=tk.W, padx=6)
+        self.kernel_slider = tk.Scale(self.color_scrollable_frame, from_=0, to=25, orient=tk.HORIZONTAL,
+                                       command=lambda v: self.on_slider_change_live())
         self.kernel_slider.set(self.kernel)
         self.kernel_slider.pack(fill=tk.X)
 
-        ttk.Label(self.color_frame, text="Min area").pack(anchor=tk.W, padx=6)
-        self.min_slider = tk.Scale(self.color_frame, from_=1, to=20000, orient=tk.HORIZONTAL,
-                                   command=lambda v: self.on_slider_change())
+        ttk.Label(self.color_scrollable_frame, text="Min area").pack(anchor=tk.W, padx=6)
+        self.min_slider = tk.Scale(self.color_scrollable_frame, from_=1, to=20000, orient=tk.HORIZONTAL,
+                                   command=lambda v: self.on_slider_change_live())
         self.min_slider.set(self.min_area)
         self.min_slider.pack(fill=tk.X)
 
         # Watershed options
-        ws_frame = ttk.Frame(self.color_frame)
+        ws_frame = ttk.Frame(self.color_scrollable_frame)
         ws_frame.pack(fill=tk.X, pady=5)
         self.ws_var = tk.IntVar(value=0)
         ttk.Checkbutton(ws_frame, text="Split touching objects (watershed)", 
                        variable=self.ws_var, command=self.on_ws_toggle).pack(anchor=tk.W)
         ttk.Label(ws_frame, text="Sensitivity").pack(anchor=tk.W, padx=6)
         self.ws_slider = tk.Scale(ws_frame, from_=1, to=80, orient=tk.HORIZONTAL,
-                                  command=lambda v: self.on_ws_slider_change())
+                                   command=lambda v: self.on_ws_slider_change_live())
         self.ws_slider.set(self.ws_sensitivity)
         self.ws_slider.pack(fill=tk.X)
+        
+        # Live preview toggle
+        preview_frame = ttk.Frame(self.color_scrollable_frame)
+        preview_frame.pack(fill=tk.X, pady=5)
+        self.live_preview_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(preview_frame, text="Enable Live Preview", 
+                       variable=self.live_preview_var).pack(anchor=tk.W)
+        ttk.Label(preview_frame, text="(May slow down performance)").pack(anchor=tk.W, padx=6)
+        
+        # Manual refresh button
+        refresh_frame = ttk.Frame(self.color_scrollable_frame)
+        refresh_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(refresh_frame, text="Refresh Preview", 
+                  command=self.refresh_color_preview).pack(anchor=tk.W)
+        
+        # Pack the scrollable components
+        color_canvas.pack(side="left", fill="both", expand=True)
+        color_scrollbar.pack(side="right", fill="y")
+        
+        # Bind mouse wheel to canvas
+        def _on_mousewheel(event):
+            color_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        color_canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         # Controls
         ttk.Button(left_panel, text="Load Image", command=self.load_image).pack(fill=tk.X, pady=4)
@@ -277,9 +335,10 @@ class UnifiedObjectCounter:
         instructions = """
 1. Select detection mode (Template or Color)
 2. Choose appearance options and flexibility
-3. Load an image (YOLO will auto-detect objects)
+3. Load an image (YOLO will auto-detect objects at different sizes)
 4. Click on a detected object or drag a box to select reference
 5. Click "Count Objects" to analyze
+6. Use "Detect different sizes using YOLO" for efficient multi-scale detection
         """
         ttk.Label(instruction_frame, text=instructions, justify=tk.LEFT).pack(padx=10, pady=8)
 
@@ -288,6 +347,12 @@ class UnifiedObjectCounter:
         results_frame.pack(fill=tk.BOTH, pady=10, expand=True)
         self.results_text = tk.Text(results_frame, height=12, width=45)
         self.results_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Status bar
+        status_frame = ttk.Frame(left_panel)
+        status_frame.pack(fill=tk.X, pady=5)
+        self.status_label = ttk.Label(status_frame, text="Ready", foreground="green")
+        self.status_label.pack(side=tk.LEFT)
 
         # Image canvas
         self.canvas = tk.Canvas(right_panel, bg="white")
@@ -299,6 +364,9 @@ class UnifiedObjectCounter:
         # Initialize UI state
         self.on_mode_change()
         self.clear_results()
+        
+        # Store initial mode for comparison
+        self.last_mode = self.mode_var.get()
 
     def on_mode_change(self):
         """Handle detection mode change"""
@@ -306,9 +374,15 @@ class UnifiedObjectCounter:
         if mode == "template":
             self.template_frame.pack(fill=tk.X, pady=10)
             self.color_frame.pack_forget()
+            # Clear any color mode results when switching to template
+            if hasattr(self, 'results') and self.results:
+                self.clear_results()
         else:
             self.template_frame.pack_forget()
             self.color_frame.pack(fill=tk.X, pady=10)
+            # Clear any template mode results when switching to color
+            if hasattr(self, 'results') and self.results:
+                self.clear_results()
 
     def on_color_mode_change(self):
         """Handle color space mode change"""
@@ -334,6 +408,10 @@ class UnifiedObjectCounter:
             self.hue_slider.set(self.tol.b)
             self.sat_slider.set(self.tol.g)
             self.val_slider.set(self.tol.r)
+        
+        # Update preview immediately when mode changes (like color_object_counter.py)
+        if self.original_image is not None and self.selected_roi is not None:
+            self.update_color_preview()
 
     def on_slider_change(self):
         """Handle slider changes"""
@@ -349,13 +427,196 @@ class UnifiedObjectCounter:
         self.kernel = int(self.kernel_slider.get())
         self.min_area = int(self.min_slider.get())
 
+    def on_slider_change_live(self):
+        """Handle slider changes with live preview"""
+        # Update the tolerance values
+        if self.use_hsv:
+            self.tol.hue = int(self.hue_slider.get())
+            self.tol.sat = int(self.sat_slider.get())
+            self.tol.val = int(self.val_slider.get())
+        else:
+            self.tol.b = int(self.hue_slider.get())
+            self.tol.g = int(self.sat_slider.get())
+            self.tol.r = int(self.val_slider.get())
+        
+        self.kernel = int(self.kernel_slider.get())
+        self.min_area = int(self.min_slider.get())
+        
+        # Always update preview when sliders change (like color_object_counter.py)
+        if self.original_image is not None and self.selected_roi is not None:
+            self.update_color_preview()
+
     def on_ws_toggle(self):
         """Handle watershed toggle"""
         self.use_watershed = (self.ws_var.get() == 1)
+        
+        # Update preview immediately when watershed changes (like color_object_counter.py)
+        if self.original_image is not None and self.selected_roi is not None:
+            self.update_color_preview()
 
     def on_ws_slider_change(self):
         """Handle watershed sensitivity change"""
         self.ws_sensitivity = int(self.ws_slider.get())
+        
+        # Update preview immediately when watershed sensitivity changes (like color_object_counter.py)
+        if self.original_image is not None and self.selected_roi is not None:
+            self.update_color_preview()
+
+    def on_ws_slider_change_live(self):
+        """Handle watershed sensitivity change with live preview"""
+        self.ws_sensitivity = int(self.ws_slider.get())
+        
+        # Always update preview when watershed changes (like color_object_counter.py)
+        if self.original_image is not None and self.selected_roi is not None:
+            self.update_color_preview()
+
+    def live_preview_color_segmentation(self):
+        """Show live preview of color segmentation"""
+        try:
+            # Update status
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Live Preview Active", foreground="blue")
+            
+            # Get current ROI
+            x1, y1, x2, y2 = self.selected_roi
+            roi = self.original_image[y1:y2, x1:x2]
+            
+            # Get color information from ROI
+            roi_mean_bgr = get_most_frequent_color(roi, 'bgr')
+            roi_mean_hsv = get_most_frequent_color(roi, 'hsv')
+            
+            # Compute mask using current settings
+            mask = compute_mask(self.original_image, roi_mean_bgr, roi_mean_hsv,
+                               self.tol, self.use_hsv, self.kernel)
+            
+            # Optional watershed split
+            if self.use_watershed:
+                mask = self.apply_watershed_split(mask)
+            
+            # Extract objects for preview
+            num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            preview_objects = []
+            for i in range(1, num):
+                x, y, w, h, area = stats[i]
+                if area >= self.min_area:
+                    preview_objects.append((x, y, w, h, area))
+            
+            # Create preview image
+            preview_image = self.original_image.copy()
+            
+            # Draw reference object
+            cv2.rectangle(preview_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(preview_image, "Reference", (x1, y1-10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+            # Draw detected objects
+            for x, y, w, h, area in preview_objects:
+                cv2.rectangle(preview_image, (x, y), (x+w, y+h), (255, 0, 0), 1)
+                cv2.putText(preview_image, "O", (x, y-5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 0), 1)
+            
+            # Update display with preview
+            self.display_image = cv2.cvtColor(preview_image, cv2.COLOR_BGR2RGB)
+            self.display_image_on_canvas()
+            
+            # Update results text with live count
+            self.results_text.delete(1.0, tk.END)
+            self.results_text.insert(tk.END, f"Live Preview - Objects Found: {len(preview_objects)}\n")
+            self.results_text.insert(tk.END, f"Current Settings:\n")
+            if self.use_hsv:
+                self.results_text.insert(tk.END, f"HSV (H:{self.tol.hue}, S:{self.tol.sat}, V:{self.tol.val})\n")
+            else:
+                self.results_text.insert(tk.END, f"BGR (B:{self.tol.b}, G:{self.tol.g}, R:{self.tol.r})\n")
+            self.results_text.insert(tk.END, f"Kernel: {self.kernel}, Min Area: {self.min_area}\n")
+            self.results_text.insert(tk.END, f"Watershed: {'On' if self.use_watershed else 'Off'}")
+            if self.use_watershed:
+                self.results_text.insert(tk.END, f" (Sensitivity: {self.ws_sensitivity})")
+            
+        except Exception as e:
+            print(f"Live preview error: {e}")
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Live Preview Error", foreground="red")
+
+    def refresh_color_preview(self):
+        """Manually refresh the color segmentation preview"""
+        if self.original_image is not None and self.selected_roi is not None:
+            self.update_color_preview()
+        else:
+            messagebox.showwarning("Warning", "Please load an image and select a ROI first")
+
+    def update_color_preview(self):
+        """Update color preview in real-time like color_object_counter.py"""
+        if self.original_image is None or self.selected_roi is None:
+            return
+        
+        try:
+            # Update status
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Updating Preview...", foreground="blue")
+            
+            # Read current slider values
+            if self.use_hsv:
+                self.tol.hue = int(self.hue_slider.get())
+                self.tol.sat = int(self.sat_slider.get())
+                self.tol.val = int(self.val_slider.get())
+            else:
+                self.tol.b = int(self.hue_slider.get())
+                self.tol.g = int(self.sat_slider.get())
+                self.tol.r = int(self.val_slider.get())
+            
+            self.kernel = int(self.kernel_slider.get())
+            self.min_area = int(self.min_slider.get())
+            self.use_hsv = (self.color_mode_var.get() == 1)
+
+            # Get ROI and compute mask
+            x1, y1, x2, y2 = self.selected_roi
+            roi = self.original_image[y1:y2, x1:x2]
+            
+            # Use most frequent color instead of mean to avoid background interference
+            roi_mean_bgr = get_most_frequent_color(roi, 'bgr')
+            roi_mean_hsv = get_most_frequent_color(roi, 'hsv')
+            
+            mask = compute_mask(self.original_image, roi_mean_bgr, roi_mean_hsv,
+                               self.tol, self.use_hsv, self.kernel)
+            
+            # Optional watershed split for preview
+            if self.use_watershed:
+                self.ws_sensitivity = int(self.ws_slider.get())
+                mask = self.apply_watershed_split(mask)
+            
+            # Count and draw objects
+            vis, count = count_and_draw(mask, self.image, max(1, self.min_area))
+            
+            # Update results with the current detection
+            num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            objects = []
+            for i in range(1, num):
+                x, y, w, h, area = stats[i]
+                if area >= self.min_area:
+                    objects.append((x, y, w, h, area))
+            
+            # Store results for display
+            self.results = {
+                'objects': objects, 
+                'reference_area': (x2 - x1) * (y2 - y1), 
+                'no_objects_found': False
+            }
+            
+            # Update display
+            self.display_image = vis
+            self.display_image_on_canvas()
+            
+            # Update results text immediately
+            self.display_results()
+            
+            # Reset status
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Ready", foreground="green")
+                
+        except Exception as e:
+            print(f"Preview update error: {e}")
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Preview Error", foreground="red")
 
     # ----------------------- Image / ROI handlers -----------------------
     def load_image(self):
@@ -368,8 +629,8 @@ class UnifiedObjectCounter:
         
         img_bgr = cv2.imread(file_path)
         if img_bgr is None:
-            messagebox.showerror("Error", "Failed to load image")
-            return
+                messagebox.showerror("Error", "Failed to load image")
+                return
 
         self.original_image = img_bgr.copy()
         self.image = cv2.cvtColor(img_bgr.copy(), cv2.COLOR_BGR2RGB)
@@ -421,6 +682,10 @@ class UnifiedObjectCounter:
                     # Object selected
                     self.selected_roi = (x, y, x + w, y + h)
                     self.highlight_selected_object(i)
+                    
+                    # Trigger preview update immediately (like color_object_counter.py)
+                    if self.mode_var.get() == "color":
+                        self.update_color_preview()
                     return
         
         # Fall back to rectangle selection if no objects highlighted
@@ -452,6 +717,10 @@ class UnifiedObjectCounter:
             if x2 > x1 and y2 > y1:
                 self.selected_roi = (x1, y1, x2, y2)
                 messagebox.showinfo("Info", f"ROI selected: {self.selected_roi}")
+                
+                # Trigger preview update immediately for color mode (like color_object_counter.py)
+                if self.mode_var.get() == "color":
+                    self.update_color_preview()
 
     # ----------------------- Template Matching Methods -----------------------
     def rotate_image(self, img, angle):
@@ -528,11 +797,22 @@ class UnifiedObjectCounter:
         detect_different_sizes = self.sizes_var.get()
         
         # Show progress in results area
-        if detect_rotated:
+        if detect_rotated or detect_different_sizes:
             self.results_text.delete(1.0, tk.END)
-            self.results_text.insert(tk.END, "⚠️ WARNING: Rotation detection is enabled.\n")
-            self.results_text.insert(tk.END, "This will process 24 different angles and may take 10-30 seconds.\n")
-            self.results_text.insert(tk.END, "Processing rotations... Please wait.\n")
+            
+            if detect_rotated and detect_different_sizes:
+                self.results_text.insert(tk.END, "⚠️ WARNING: Both rotation AND YOLO size detection enabled!\n")
+                self.results_text.insert(tk.END, "This will process 24 angles + use YOLO's pre-detected multi-scale objects.\n")
+                self.results_text.insert(tk.END, "May take 30-60 seconds but much faster than template scaling.\n")
+                self.results_text.insert(tk.END, "YOLO has already detected objects at different scales when loading the image.\n")
+            elif detect_rotated:
+                self.results_text.insert(tk.END, "⚠️ WARNING: Rotation detection is enabled.\n")
+                self.results_text.insert(tk.END, "This will process 24 different angles and may take 10-30 seconds.\n")
+            elif detect_different_sizes:
+                self.results_text.insert(tk.END, "✅ YOLO size detection is enabled.\n")
+                self.results_text.insert(tk.END, "This will use YOLO's pre-detected objects at different scales (much faster).\n")
+            
+            self.results_text.insert(tk.END, "Processing... Please wait.\n")
             self.results_text.see(tk.END)
             self.root.update()
         
@@ -570,9 +850,12 @@ class UnifiedObjectCounter:
             self.root.title("Unified Smart Object Counter - Processing rotations...")
             self.root.update()
             
-            # Add timeout protection
+            # Add timeout protection - YOLO size detection is much faster
             start_time = time.time()
-            max_time = 30  # Maximum 30 seconds for rotation detection
+            if detect_different_sizes:
+                max_time = 60   # 1 minute for combined rotation + YOLO size detection
+            else:
+                max_time = 30   # 30 seconds for rotation only
             
             for i, angle in enumerate(angles):
                 # Check timeout
@@ -606,23 +889,43 @@ class UnifiedObjectCounter:
             # Reset title
             self.root.title("Unified Smart Object Counter")
         
-        # Size scaling detection
+        # YOLO-based size detection (uses YOLO's multi-scale capabilities)
         if detect_different_sizes:
-            scales = [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4]
+            self.results_text.insert(tk.END, f"\nUsing YOLO's multi-scale detection capabilities...\n")
+            self.results_text.insert(tk.END, f"YOLO has already detected objects at different scales when loading the image.\n")
+            self.results_text.see(tk.END)
+            self.root.update()
             
-            for scale in scales:
-                scaled_w = int(roi_gray.shape[1] * scale)
-                scaled_h = int(roi_gray.shape[0] * scale)
-                if scaled_w < 10 or scaled_h < 10:
-                    continue
+            # Use YOLO's pre-detected objects at different scales
+            if hasattr(self, 'detected_objects') and self.detected_objects:
+                roi_area = (x2 - x1) * (y2 - y1)
+                roi_aspect = (x2 - x1) / (y2 - y1)
                 
-                scaled_roi = cv2.resize(roi_gray, (scaled_w, scaled_h))
-                res = cv2.matchTemplate(img_gray, scaled_roi, cv2.TM_CCOEFF_NORMED)
-                auto_thr = self.compute_auto_template_threshold(res)
+                # Find YOLO objects similar to the selected ROI (different sizes)
+                similar_objects = []
+                for obj in self.detected_objects:
+                    obj_area = obj['w'] * obj['h']
+                    obj_aspect = obj['w'] / obj['h']
+                    
+                    # Check if object is similar in size and aspect ratio (within tolerance)
+                    area_ratio = max(roi_area, obj_area) / min(roi_area, obj_area)
+                    aspect_diff = abs(roi_aspect - obj_aspect)
+                    
+                    # Consider objects similar if area ratio < 4 and aspect difference < 0.5
+                    if area_ratio < 4 and aspect_diff < 0.5:
+                        similar_objects.append(obj)
                 
-                loc = np.where(res >= auto_thr)
-                for pt in zip(*loc[::-1]):
-                    rectangles.append([pt[0], pt[1], scaled_w, scaled_h])
+                # Add similar YOLO objects to the results
+                for obj in similar_objects:
+                    x, y, w, h = obj['x'], obj['y'], obj['w'], obj['h']
+                    rectangles.append([x, y, w, h])
+                
+                self.results_text.insert(tk.END, f"Found {len(similar_objects)} similar objects using YOLO's multi-scale detection.\n")
+                self.results_text.see(tk.END)
+                self.root.update()
+            else:
+                self.results_text.insert(tk.END, f"No YOLO objects available for size comparison.\n")
+                self.results_text.see(tk.END)
         
         # Apply NMS to remove overlapping detections
         if rectangles:
@@ -633,14 +936,14 @@ class UnifiedObjectCounter:
 
     # ----------------------- Color Segmentation Methods -----------------------
     def color_segmentation_detection(self):
-        """Perform color-based segmentation detection"""
+        """Perform color-based segmentation detection (like color_object_counter.py)"""
         if self.selected_roi is None:
             return [], "No ROI selected"
         
         x1, y1, x2, y2 = self.selected_roi
         roi = self.original_image[y1:y2, x1:x2]
         
-        # Get color information from ROI
+        # Use most frequent color instead of mean to avoid background interference
         roi_mean_bgr = get_most_frequent_color(roi, 'bgr')
         roi_mean_hsv = get_most_frequent_color(roi, 'hsv')
         
@@ -733,6 +1036,7 @@ class UnifiedObjectCounter:
                     conf = float(b.conf[0]) if hasattr(b, 'conf') else 0.0
                     x, y, w, h = x1, y1, x2 - x1, y2 - y1
                     yolo_boxes.append({'x': x, 'y': y, 'w': w, 'h': h, 'label': label, 'conf': conf})
+                
                 print(f"YOLO found {len(yolo_boxes)} raw detections")
                 # Keep only reasonably confident boxes
                 self.detected_objects = [d for d in yolo_boxes if d['conf'] >= 0.1]
@@ -812,6 +1116,28 @@ class UnifiedObjectCounter:
             return
 
         try:
+            # Check for potentially problematic combinations in template matching
+            if (self.mode_var.get() == "template" and 
+                self.rotated_var.get() and 
+                self.sizes_var.get()):
+                
+                # Inform user about the combination
+                response = messagebox.askyesno(
+                    "YOLO + Rotation Detection",
+                    "You have selected BOTH 'Detect rotated objects' AND 'Detect different sizes using YOLO'.\n\n"
+                    "This combination will process 24 angles + use YOLO's pre-detected multi-scale objects.\n"
+                    "Much faster than template scaling - may take 30-60 seconds.\n\n"
+                    "YOLO has already detected objects at different scales when loading the image.\n\n"
+                    "Do you want to continue with this optimized approach?"
+                )
+                
+                if not response:
+                    return
+            
+            # Update status
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Processing...", foreground="orange")
+            
             # Disable the count button to prevent multiple clicks
             self.count_button.config(state='disabled')
             self.root.title("Unified Smart Object Counter - Processing...")
@@ -846,7 +1172,7 @@ class UnifiedObjectCounter:
                     }
                 
             else:
-                # Color segmentation detection
+                # Color segmentation detection (like color_object_counter.py)
                 objects, method_info = self.color_segmentation_detection()
                 
                 if not objects:
@@ -875,6 +1201,10 @@ class UnifiedObjectCounter:
             # Re-enable the count button and reset title
             self.count_button.config(state='normal')
             self.root.title("Unified Smart Object Counter")
+            
+            # Update status
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Ready", foreground="green")
 
     def display_results(self):
         self.results_text.delete(1.0, tk.END)
@@ -902,21 +1232,26 @@ class UnifiedObjectCounter:
                 results_text += f"- Auto Threshold: {self.template_threshold:.2f}\n"
             else:
                 results_text += "Color Segmentation Settings:\n"
+                # Show appropriate values based on current mode (like color_object_counter.py)
                 if self.use_hsv:
-                    results_text += f"- Mode: HSV (H:{self.tol.hue}, S:{self.tol.sat}, V:{self.tol.val})\n"
+                    mode_info = f"H:{self.tol.hue}  S:{self.tol.sat}  V:{self.tol.val}"
                 else:
-                    results_text += f"- Mode: BGR (B:{self.tol.b}, G:{self.tol.g}, R:{self.tol.r})\n"
-                results_text += f"- Kernel: {self.kernel}, Min Area: {self.min_area}\n"
-                results_text += f"- Watershed: {'On' if self.use_watershed else 'Off'}"
+                    mode_info = f"B:{self.tol.b}  G:{self.tol.g}  R:{self.tol.r}"
+                
+                ws_info = f"  WS:{'on' if self.use_watershed else 'off'}"
                 if self.use_watershed:
-                    results_text += f" (Sensitivity: {self.ws_sensitivity})"
+                    ws_info += f"({self.ws_sensitivity})"
+                
+                results_text += f"Mode: {'HSV' if self.use_hsv else 'BGR'}{ws_info}\n"
+                results_text += f"{mode_info}\n"
+                results_text += f"Kernel:{self.kernel}  MinArea:{self.min_area}"
         
         self.results_text.insert(tk.END, results_text)
 
     def draw_results_on_image(self):
         if not self.results:
             return
-        
+
         # Create a copy of the original image for drawing
         result_image = self.original_image.copy()
         
@@ -964,7 +1299,16 @@ class UnifiedObjectCounter:
     def clear_results(self):
         self.results = {}
         self.results_text.delete(1.0, tk.END)
-        self.results_text.insert(tk.END, "No results yet. Load image and select ROI.\n")
+        
+        # Show appropriate message based on current mode
+        if hasattr(self, 'mode_var'):
+            mode = self.mode_var.get()
+            if mode == "template":
+                self.results_text.insert(tk.END, "No results yet. Load image and select ROI for template matching.\n")
+            else:
+                self.results_text.insert(tk.END, "No results yet. Load image and select ROI for color segmentation.\n")
+        else:
+            self.results_text.insert(tk.END, "No results yet. Load image and select ROI.\n")
 
 
 def main():
